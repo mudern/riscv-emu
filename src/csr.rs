@@ -17,6 +17,8 @@ pub mod csr {
     pub const SCAUSE: u16 = 0x142;
     pub const STVAL: u16 = 0x143;
     pub const SIP: u16 = 0x144;
+    pub const SCOUNTEREN: u16 = 0x106;
+    pub const SENVCFG: u16 = 0x10A;
     pub const SATP: u16 = 0x180;
     pub const PMPCFG0: u16 = 0x3A0; // RV64 只有 pmpcfg0/2（各管 8 项）
     pub const PMPCFG2: u16 = 0x3A2;
@@ -27,6 +29,9 @@ pub mod csr {
     pub const MIDELEG: u16 = 0x303;
     pub const MIE: u16 = 0x304;
     pub const MTVEC: u16 = 0x305;
+    pub const MCOUNTEREN: u16 = 0x306;
+    pub const MENVCFG: u16 = 0x30A;
+    pub const MCOUNTINHIBIT: u16 = 0x320;
     pub const MSCRATCH: u16 = 0x340;
     pub const MEPC: u16 = 0x341;
     pub const MCAUSE: u16 = 0x342;
@@ -48,7 +53,7 @@ pub const SIE: u64 = 1 << 1;
 pub const MIE: u64 = 1 << 3;
 pub const SPIE: u64 = 1 << 5;
 pub const MPIE: u64 = 1 << 7;
-pub const SPP: u64 = 1 << 11;
+pub const SPP: u64 = 1 << 8;
 pub const MPP: u64 = 3 << 11; // 掩码
 pub const MPRV: u64 = 1 << 17;
 pub const SUM: u64 = 1 << 18;
@@ -96,6 +101,13 @@ pub struct Csrs {
     pub scause: u64,
     pub stval: u64,
     pub satp: u64,
+    /// 计数器访问使能：mcounteren 管 S/U，scounteren 管 U
+    pub mcounteren: u64,
+    pub scounteren: u64,
+    /// 存储 CSR：OpenSBI 用读探测决定特权级版本，值本身不参与计数
+    pub mcountinhibit: u64,
+    pub menvcfg: u64,
+    pub senvcfg: u64,
     /// PMP 规则（pmpcfg/pmpaddr CSR 的后端）
     pub pmp: Pmp,
 }
@@ -107,10 +119,16 @@ impl Default for Csrs {
 }
 
 impl Csrs {
-    /// misa: RV64 IMA C
+    /// misa: RV64 IMA C S U
     pub fn new() -> Self {
         Csrs {
-            misa: (2 << 62) | (1 << 0) | (1 << 2) | (1 << 8) | (1 << 12),
+            misa: (2 << 62)
+                | (1 << 0) // I
+                | (1 << 2) // M
+                | (1 << 8) // A
+                | (1 << 12) // C
+                | (1 << 18) // S
+                | (1 << 20), // U
             mstatus: 0,
             medeleg: 0,
             mideleg: 0,
@@ -127,6 +145,11 @@ impl Csrs {
             scause: 0,
             stval: 0,
             satp: 0,
+            mcounteren: 0,
+            scounteren: 0,
+            mcountinhibit: 0,
+            menvcfg: 0,
+            senvcfg: 0,
             pmp: Pmp::default(),
         }
     }
@@ -138,7 +161,10 @@ impl Csrs {
     }
 
     /// 读取 CSR；None 表示未知、无权限或非法访问（→ illegal instruction）。
-    pub fn read(&self, addr: u16, c: &Counters, mode: Privilege) -> Option<u64> {
+    ///
+    /// `ext_mip`：PLIC 等外部中断控制器持有的硬件中断线（MEIP/SEIP 位），
+    /// 读 mip/sip 时并入视图。
+    pub fn read(&self, addr: u16, c: &Counters, mode: Privilege, ext_mip: u64) -> Option<u64> {
         let m_only = matches!(addr, 0x300..=0x7FF | 0xB00..=0xBFF | 0xF11..=0xF1F);
         if m_only && mode != Privilege::M {
             return None;
@@ -161,22 +187,46 @@ impl Csrs {
             csr::MEPC => self.mepc,
             csr::MCAUSE => self.mcause,
             csr::MTVAL => self.mtval,
-            csr::MIP => self.mip,
-            csr::SSTATUS => (self.mstatus & SSTATUS_MASK) | (2 << 34), // UXL = 64 位
+            csr::MIP => (self.mip | ext_mip) & MIE_MASK,
+            csr::SSTATUS => (self.mstatus & SSTATUS_MASK) | (2 << 32), // UXL = 64 位
             csr::SIE => self.mie & self.sip_writable(),
             csr::STVEC => self.stvec,
             csr::SSCRATCH => self.sscratch,
             csr::SEPC => self.sepc,
             csr::SCAUSE => self.scause,
             csr::STVAL => self.stval,
-            csr::SIP => self.mip & self.sip_writable(),
+            csr::SIP => (self.mip | ext_mip) & self.sip_writable(),
             csr::SATP => self.satp,
+            csr::SCOUNTEREN => self.scounteren,
+            csr::SENVCFG => self.senvcfg,
+            csr::MCOUNTEREN => self.mcounteren,
+            csr::MENVCFG => self.menvcfg,
+            csr::MCOUNTINHIBIT => self.mcountinhibit,
             csr::MVENDORID | csr::MARCHID | csr::MIMPID | csr::MHARTID => 0,
-            csr::MCYCLE => c.cycle,
-            csr::MINSTRET => c.instret,
-            csr::CYCLE => c.cycle,
-            csr::TIME => c.time,
-            csr::INSTRET => c.instret,
+            // U/S 态读计数器需要 mcounteren（U 还需 scounteren）对应位
+            csr::MCYCLE | csr::MINSTRET | csr::CYCLE | csr::TIME | csr::INSTRET => {
+                let bit = match addr {
+                    csr::MCYCLE | csr::CYCLE => 1,
+                    csr::TIME => 1 << 1,
+                    _ => 1 << 2,
+                };
+                let (s_ok, u_ok) = (self.mcounteren & bit != 0, {
+                    self.mcounteren & bit != 0 && self.scounteren & bit != 0
+                });
+                let val = match addr {
+                    csr::MCYCLE => c.cycle,
+                    csr::MINSTRET => c.instret,
+                    csr::CYCLE => c.cycle,
+                    csr::TIME => c.time,
+                    _ => c.instret,
+                };
+                match mode {
+                    Privilege::M => val,
+                    Privilege::S if s_ok => val,
+                    Privilege::U if u_ok => val,
+                    _ => return None,
+                }
+            }
             _ => return None,
         })
     }
@@ -221,6 +271,11 @@ impl Csrs {
             csr::SCAUSE => self.scause = val,
             csr::STVAL => self.stval = val,
             csr::SATP => self.satp = val,
+            csr::SCOUNTEREN => self.scounteren = val & 0x7,
+            csr::SENVCFG => self.senvcfg = val,
+            csr::MCOUNTEREN => self.mcounteren = val & 0x7,
+            csr::MENVCFG => self.menvcfg = val,
+            csr::MCOUNTINHIBIT => self.mcountinhibit = val,
             _ => return false,
         }
         true
@@ -285,10 +340,17 @@ mod tests {
     #[test]
     fn permission() {
         let mut csr = Csrs::new();
-        assert_eq!(csr.read(csr::SSTATUS, &counters(), Privilege::U), None);
-        assert_eq!(csr.read(csr::MSTATUS, &counters(), Privilege::S), None);
+        assert_eq!(csr.read(csr::SSTATUS, &counters(), Privilege::U, 0), None);
+        assert_eq!(csr.read(csr::MSTATUS, &counters(), Privilege::S, 0), None);
         assert!(!csr.write(csr::MEPC, 1, Privilege::S));
-        assert_eq!(csr.read(csr::CYCLE, &counters(), Privilege::U), Some(1));
+        // 计数器访问权限：U 态默认无权，mcounteren/scounteren 使能后放开
+        assert_eq!(csr.read(csr::CYCLE, &counters(), Privilege::U, 0), None);
+        assert_eq!(csr.read(csr::TIME, &counters(), Privilege::S, 0), None);
+        assert!(csr.write(csr::MCOUNTEREN, 0x7, Privilege::M));
+        assert_eq!(csr.read(csr::TIME, &counters(), Privilege::S, 0), Some(3));
+        assert_eq!(csr.read(csr::CYCLE, &counters(), Privilege::U, 0), None);
+        assert!(csr.write(csr::SCOUNTEREN, 0x7, Privilege::S));
+        assert_eq!(csr.read(csr::CYCLE, &counters(), Privilege::U, 0), Some(1));
     }
 
     #[test]
@@ -298,11 +360,11 @@ mod tests {
         assert_eq!(csr.mstatus & !SSTATUS_MASK, 0, "sstatus 只能影响 S 可见位");
         // M 态写 mstatus.MIE 不应被 sstatus 读出
         assert!(csr.write(csr::MSTATUS, MIE, Privilege::M));
-        let view = csr.read(csr::SSTATUS, &counters(), Privilege::S).unwrap();
+        let view = csr.read(csr::SSTATUS, &counters(), Privilege::S, 0).unwrap();
         assert_eq!(view & MIE, 0);
-        assert_eq!(view & (2 << 34), 2 << 34, "UXL 应读出 64 位");
+        assert_eq!(view & (2 << 32), 2 << 32, "UXL 应读出 64 位");
         // mstatus 读出 SXL/UXL
-        let ms = csr.read(csr::MSTATUS, &counters(), Privilege::M).unwrap();
+        let ms = csr.read(csr::MSTATUS, &counters(), Privilege::M, 0).unwrap();
         assert_eq!(ms & (2 << 32) | (2 << 34), (2 << 32) | (2 << 34));
     }
 
@@ -312,11 +374,11 @@ mod tests {
         let c = counters();
         // 未委派：写 sip.STIP 被忽略
         assert!(csr.write(csr::SIP, STIP, Privilege::S));
-        assert_eq!(csr.read(csr::SIP, &c, Privilege::S).unwrap(), 0);
+        assert_eq!(csr.read(csr::SIP, &c, Privilege::S, 0).unwrap(), 0);
         // 委派后可写
         csr.mideleg = STIP;
         assert!(csr.write(csr::SIP, STIP, Privilege::S));
-        assert_eq!(csr.read(csr::SIP, &c, Privilege::S).unwrap(), STIP);
+        assert_eq!(csr.read(csr::SIP, &c, Privilege::S, 0).unwrap(), STIP);
         // M 态 mip 同样受委派位约束（除 SSIP）
         csr.mideleg = 0;
         assert!(csr.write(csr::MIP, 0, Privilege::M)); // 尝试清 STIP → 被忽略
@@ -331,17 +393,17 @@ mod tests {
         let c = counters();
         // pmpaddr 属 M 态：S 态读写都拒绝
         assert!(!csr.write(csr::PMPADDR0, 1, Privilege::S));
-        assert_eq!(csr.read(csr::PMPADDR0, &c, Privilege::S), None);
+        assert_eq!(csr.read(csr::PMPADDR0, &c, Privilege::S, 0), None);
         assert!(csr.write(csr::PMPADDR0, 0x1234, Privilege::M));
-        assert_eq!(csr.read(csr::PMPADDR0, &c, Privilege::M), Some(0x1234));
+        assert_eq!(csr.read(csr::PMPADDR0, &c, Privilege::M, 0), Some(0x1234));
         // pmpcfg0 字节 0 = NAPOT|RWX；pmpcfg1 在 RV64 不存在
         assert!(csr.write(csr::PMPCFG0, 0x1F, Privilege::M));
-        assert_eq!(csr.read(csr::PMPCFG0, &c, Privilege::M), Some(0x1F));
+        assert_eq!(csr.read(csr::PMPCFG0, &c, Privilege::M, 0), Some(0x1F));
         assert_eq!(csr.pmp.num_rules(), 1);
-        assert_eq!(csr.read(0x3A1, &c, Privilege::M), None);
+        assert_eq!(csr.read(0x3A1, &c, Privilege::M, 0), None);
         // 写 L 后该项锁死：再写被忽略
         assert!(csr.write(csr::PMPCFG0, 0x80, Privilege::M));
         assert!(csr.write(csr::PMPCFG0, 0, Privilege::M));
-        assert_eq!(csr.read(csr::PMPCFG0, &c, Privilege::M), Some(0x80));
+        assert_eq!(csr.read(csr::PMPCFG0, &c, Privilege::M, 0), Some(0x80));
     }
 }

@@ -17,5 +17,6 @@ pub mod pmp;
 pub use bus::{Bus, DRAM_BASE};
 pub use cpu::{Cpu, Privilege};
 pub use csr::Csrs;
+pub use devices::UART_IRQ;
 pub use exception::{Exception, TrapInfo};
 pub use machine::{Halt, Machine};

@@ -1,7 +1,7 @@
 //! 系统总线：把物理地址路由到 RAM 或 MMIO 设备。
 //! 布局对齐 QEMU `virt` 机器，方便将来直接启动 OpenSBI/Linux。
 
-use crate::devices::{Clint, TestDevice, Uart};
+use crate::devices::{Clint, IrqLines, Plic, TestDevice, Uart, UART_IRQ};
 use crate::exception::Exception;
 
 pub const DRAM_BASE: u64 = 0x8000_0000;
@@ -9,6 +9,8 @@ pub const TEST_BASE: u64 = 0x0010_0000;
 pub const TEST_END: u64 = TEST_BASE + 0x1000;
 pub const CLINT_BASE: u64 = 0x0200_0000;
 pub const CLINT_END: u64 = CLINT_BASE + 0x0001_0000;
+pub const PLIC_BASE: u64 = 0x0C00_0000;
+pub const PLIC_END: u64 = PLIC_BASE + 0x0040_0000;
 pub const UART_BASE: u64 = 0x1000_0000;
 pub const UART_END: u64 = UART_BASE + 0x100;
 
@@ -16,6 +18,7 @@ pub struct Bus {
     pub dram: Vec<u8>,
     pub uart: Uart,
     pub clint: Clint,
+    pub plic: Plic,
     pub test: TestDevice,
 }
 
@@ -25,6 +28,7 @@ impl Bus {
             dram: vec![0; dram_size],
             uart: Uart::new(),
             clint: Clint::new(),
+            plic: Plic::default(),
             test: TestDevice::new(),
         }
     }
@@ -49,7 +53,15 @@ impl Bus {
         true
     }
 
-    pub fn load(&self, addr: u64, size: u32) -> Result<u64, Exception> {
+    /// 刷新 PLIC 挂起锁存（设备线电平 → 上沿置位）。由运行循环每步调用。
+    pub fn plic_sync(&mut self) {
+        let lines = IrqLines {
+            uart: self.uart.irq_line(),
+        };
+        self.plic.sync(lines);
+    }
+
+    pub fn load(&mut self, addr: u64, size: u32) -> Result<u64, Exception> {
         if let Some(off) = addr.checked_sub(DRAM_BASE) {
             let end = off as usize + size as usize;
             if end <= self.dram.len() {
@@ -58,7 +70,22 @@ impl Bus {
         }
         match addr {
             CLINT_BASE..CLINT_END => Ok(self.clint.load(addr - CLINT_BASE, size)),
-            UART_BASE..UART_END => Ok(self.uart.read(addr - UART_BASE) as u64),
+            PLIC_BASE..PLIC_END => {
+                let rel = addr - PLIC_BASE;
+                // claim 寄存器（context + 4）读取即认领，需网关副作用
+                let claim =
+                    (0x20_0000..0x20_2000).contains(&rel) && rel % 0x1000 == 4 && size == 4;
+                Ok(self.plic.load(rel, size, claim))
+            }
+            UART_BASE..UART_END => {
+                let v = self.uart.read(addr - UART_BASE) as u64;
+                // 设备状态变化后的重断言：RBR 弹出后 FIFO 仍非空等场景
+                // （对齐 QEMU 串口每次状态变化后重发 qemu_set_irq）
+                if self.uart.irq_line() {
+                    self.plic.latch(UART_IRQ);
+                }
+                Ok(v)
+            }
             TEST_BASE..TEST_END => Ok(0),
             _ => Err(Exception::LoadAccessFault),
         }
@@ -74,10 +101,11 @@ impl Bus {
         }
         match addr {
             CLINT_BASE..CLINT_END => self.clint.store(addr - CLINT_BASE, size, val),
+            PLIC_BASE..PLIC_END => self.plic.store(addr - PLIC_BASE, val),
             UART_BASE..UART_END => {
-                let off = addr - UART_BASE;
-                if off == 0 {
-                    self.uart.write(0, val as u8);
+                self.uart.write(addr - UART_BASE, val as u8);
+                if self.uart.irq_line() {
+                    self.plic.latch(UART_IRQ);
                 }
             }
             TEST_BASE..TEST_END => self.test.store(val),

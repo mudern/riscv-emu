@@ -1,0 +1,123 @@
+/dts-v1/;
+
+// 设备树：对齐 QEMU `virt` 机器（qemu-system-riscv64 -M virt），做如下裁剪：
+//   1. CPU 扩展：只保留本模拟器实现的 rv64imac（Zicsr/Zifencei 隐含），
+//      mmu-type 固定 Sv39 —— 用
+//      `qemu-system-riscv64 -M virt,dumpdtb -cpu rv64,f=off,d=off,v=off,h=off,
+//       zfa=off,zawrs=off,sstc=off,svadu=off,zicbom=off,zicbop=off,zicboz=off,
+//       zba=off,zbb=off,zbc=off,zbs=off,zihintntl=off,zihintpause=off,zihpm=off,
+//       sv48=off,sv57=off,sv39=on` 生成后手工编辑。
+//   2. 删除本模拟器未实现的设备节点（本模拟器上读其 MMIO 会触发 load fault，
+//      内核 probe 会 oops）：pci、virtio_mmio×8、goldfish-rtc、fw-cfg、
+//      cfi-flash、platform-bus。
+//   3. 保留：serial（ns16550a，PLIC 源 10）、test（sifive_test，关机）、
+//      clint、plic（riscv,ndev=95，M/S 两个 context）、chosen/stdout-path。
+// 重新编译：dtc -I dts -O dtb -o board/virt.dtb board/virt.dts
+//
+// memory 节点固定 128MB，与本模拟器默认 --mem 128 一致。
+
+/ {
+	#address-cells = <0x02>;
+	#size-cells = <0x02>;
+	compatible = "riscv-virtio";
+	model = "riscv-virtio,qemu";
+
+	poweroff {
+		value = <0x5555>;
+		offset = <0x00>;
+		regmap = <0x04>;
+		compatible = "syscon-poweroff";
+	};
+
+	reboot {
+		value = <0x7777>;
+		offset = <0x00>;
+		regmap = <0x04>;
+		compatible = "syscon-reboot";
+	};
+
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x00 0x80000000 0x00 0x8000000>;
+	};
+
+	cpus {
+		#address-cells = <0x01>;
+		#size-cells = <0x00>;
+		timebase-frequency = <0x989680>; // 10MHz，同 CLINT
+
+		cpu@0 {
+			phandle = <0x01>;
+			device_type = "cpu";
+			reg = <0x00>;
+			status = "okay";
+			compatible = "riscv";
+			riscv,isa-extensions = "i", "m", "a", "c", "zicntr", "zicsr", "zifencei";
+			riscv,isa = "rv64imac_zicntr_zicsr_zifencei";
+			mmu-type = "riscv,sv39";
+
+			interrupt-controller {
+				#interrupt-cells = <0x01>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+				phandle = <0x02>;
+			};
+		};
+
+		cpu-map {
+			cluster0 {
+				core0 {
+					cpu = <0x01>;
+				};
+			};
+		};
+	};
+
+	aliases {
+		serial0 = "/soc/serial@10000000";
+	};
+
+	chosen {
+		stdout-path = "/soc/serial@10000000";
+		// 固定熵种子：保证两次引导内核随机池状态一致，便于差分
+		rng-seed = <0x1e76c20 0xe1a3be35 0x3475553d 0x6e8dddf0 0x340ae3ad 0x2bf2e8c2 0xbeae471d 0x104bbeca>;
+	};
+
+	soc {
+		#address-cells = <0x02>;
+		#size-cells = <0x02>;
+		compatible = "simple-bus";
+		ranges;
+
+		serial@10000000 {
+			interrupts = <0x0a>;
+			interrupt-parent = <0x03>;
+			clock-frequency = <0x384000>; // 3.6864MHz
+			reg = <0x00 0x10000000 0x00 0x100>;
+			compatible = "ns16550a";
+		};
+
+		test@100000 {
+			phandle = <0x04>;
+			reg = <0x00 0x100000 0x00 0x1000>;
+			compatible = "sifive,test1", "sifive,test0", "syscon";
+		};
+
+		interrupt-controller@c000000 {
+			phandle = <0x03>;
+			riscv,ndev = <0x5f>;
+			reg = <0x00 0xc000000 0x00 0x600000>;
+			interrupts-extended = <0x02 0x0b 0x02 0x09>; // MEIP / SEIP
+			interrupt-controller;
+			compatible = "sifive,plic-1.0.0", "riscv,plic0";
+			#address-cells = <0x00>;
+			#interrupt-cells = <0x01>;
+		};
+
+		clint@2000000 {
+			interrupts-extended = <0x02 0x03 0x02 0x07>; // MSIP / MTIP
+			reg = <0x00 0x2000000 0x00 0x10000>;
+			compatible = "sifive,clint0", "riscv,clint0";
+		};
+	};
+};

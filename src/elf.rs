@@ -29,12 +29,11 @@ pub fn load_elf(image: &[u8], bus: &mut Bus) -> Result<u64, String> {
         return Err("不是 RISC-V 镜像（e_machine != EM_RISCV）".into());
     }
     let e_type = u16_at(image, 16);
-    if e_type == 3 {
-        return Err("暂不支持 PIE（ET_DYN），请用 -static -no-pie 重新编译".into());
-    }
-    if e_type != 2 {
+    if e_type != 2 && e_type != 3 {
         return Err(format!("不支持的 ELF 类型 e_type={e_type}"));
     }
+    // ET_DYN（OpenSBI fw_dynamic 等）：与 QEMU 的 load_elf 一致，直接按
+    // p_vaddr 链接地址加载（固件链接在 0x8000_0000，不实际重定位）。
 
     let entry = u64_at(image, 24);
     let phoff = u64_at(image, 32) as usize;

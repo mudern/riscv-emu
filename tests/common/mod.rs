@@ -61,6 +61,9 @@ pub fn lb(rd: u32, rs1: u32, imm: i32) -> u32 {
 pub fn sd(rs2: u32, rs1: u32, imm: i32) -> u32 {
     s_type(imm, rs2, rs1, 3, 0x23)
 }
+pub fn sw(rs2: u32, rs1: u32, imm: i32) -> u32 {
+    s_type(imm, rs2, rs1, 2, 0x23)
+}
 pub fn sb(rs2: u32, rs1: u32, imm: i32) -> u32 {
     s_type(imm, rs2, rs1, 0, 0x23)
 }

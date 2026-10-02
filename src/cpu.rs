@@ -53,6 +53,9 @@ pub struct Cpu {
     pub trace: bool,
     /// 内置 SBI：开启后 S 态 ecall 不再走异常交付，而是按 SBI 调用处理
     pub sbi: bool,
+    /// 外部中断控制器持有的中断线（PLIC）：MEIP/SEIP 位，运行循环每步刷新。
+    /// 与 mip 中软件可写的 SEIP 位合并后才是有效视图。
+    pub ext_mip: u64,
 }
 
 type ExecResult = Result<(), (Exception, u64)>;
@@ -70,6 +73,7 @@ impl Cpu {
             instret: 0,
             trace: false,
             sbi: false,
+            ext_mip: 0,
         }
     }
 
@@ -146,6 +150,64 @@ impl Cpu {
     }
 
     // ---- 执行 ----
+
+    /// 翻译 + PMP 检查一个可能跨页的访问。跨页时拆成两段分别检查（异常按
+    /// 先失败的那段汇报，tval 为该段的虚拟地址）。返回 (pa0, n0, pa1, n1)，
+    /// 不跨页时 n1 = 0。
+    fn split_access(
+        &mut self,
+        bus: &mut Bus,
+        vaddr: u64,
+        size: u32,
+        acc: Access,
+    ) -> Result<(u64, u32, u64, u32), (Exception, u64)> {
+        if (vaddr & 0xFFF) + size as u64 <= 0x1000 {
+            let pa = self.translate(bus, vaddr, acc).map_err(|e| (e, vaddr))?;
+            self.pmp_check(pa, size, acc, vaddr)?;
+            return Ok((pa, size, 0, 0));
+        }
+        let n0 = (0x1000 - (vaddr & 0xFFF)) as u32;
+        let n1 = size - n0;
+        let va1 = vaddr.wrapping_add(n0 as u64);
+        let pa0 = self.translate(bus, vaddr, acc).map_err(|e| (e, vaddr))?;
+        self.pmp_check(pa0, n0, acc, vaddr)?;
+        let pa1 = self.translate(bus, va1, acc).map_err(|e| (e, va1))?;
+        self.pmp_check(pa1, n1, acc, va1)?;
+        Ok((pa0, n0, pa1, n1))
+    }
+
+    /// 带权限检查的 load（跨页自动拆分后按小端拼合）
+    fn guest_load(
+        &mut self,
+        bus: &mut Bus,
+        vaddr: u64,
+        size: u32,
+    ) -> Result<u64, (Exception, u64)> {
+        let (pa0, n0, pa1, n1) = self.split_access(bus, vaddr, size, Access::Load)?;
+        let lo = bus.load(pa0, n0).map_err(|e| (e, vaddr))?;
+        if n1 == 0 {
+            return Ok(lo);
+        }
+        let hi = bus.load(pa1, n1).map_err(|e| (e, vaddr.wrapping_add(n0 as u64)))?;
+        Ok(lo | (hi << (n0 * 8)))
+    }
+
+    /// 带权限检查的 store（跨页自动拆分）
+    fn guest_store(
+        &mut self,
+        bus: &mut Bus,
+        vaddr: u64,
+        size: u32,
+        val: u64,
+    ) -> Result<(), (Exception, u64)> {
+        let (pa0, n0, pa1, n1) = self.split_access(bus, vaddr, size, Access::Store)?;
+        bus.store(pa0, n0, val).map_err(|e| (e, vaddr))?;
+        if n1 != 0 {
+            bus.store(pa1, n1, val >> (n0 * 8))
+                .map_err(|e| (e, vaddr.wrapping_add(n0 as u64)))?;
+        }
+        Ok(())
+    }
 
     /// 执行一条指令。返回 Err 表示无法交付的异常（guest 没有 handler）。
     pub fn step(&mut self, bus: &mut Bus, console: &mut Vec<u8>) -> Result<(), TrapInfo> {
@@ -238,11 +300,7 @@ impl Cpu {
             }
             Inst::Load { op, rd, rs1, imm } => {
                 let vaddr = self.reg(rs1).wrapping_add(imm as u64);
-                let phys = self
-                    .translate(bus, vaddr, Access::Load)
-                    .map_err(|e| (e, vaddr))?;
-                self.pmp_check(phys, op.size(), Access::Load, vaddr)?;
-                let raw = bus.load(phys, op.size()).map_err(|e| (e, vaddr))?;
+                let raw = self.guest_load(bus, vaddr, op.size())?;
                 let val = match op {
                     LoadOp::B => (raw as u8 as i8) as i64 as u64,
                     LoadOp::Bu => raw & 0xFF,
@@ -256,12 +314,7 @@ impl Cpu {
             }
             Inst::Store { op, rs1, rs2, imm } => {
                 let vaddr = self.reg(rs1).wrapping_add(imm as u64);
-                let phys = self
-                    .translate(bus, vaddr, Access::Store)
-                    .map_err(|e| (e, vaddr))?;
-                self.pmp_check(phys, op.size(), Access::Store, vaddr)?;
-                bus.store(phys, op.size(), self.reg(rs2))
-                    .map_err(|e| (e, vaddr))?;
+                self.guest_store(bus, vaddr, op.size(), self.reg(rs2))?;
             }
             Inst::OpImm { op, rd, rs1, imm } => {
                 let a = self.reg(rs1);
@@ -288,12 +341,24 @@ impl Cpu {
                 rs2,
             } => {
                 let vaddr = self.reg(rs1);
+                let size = if w { 4 } else { 8 };
+                // LR/SC 及 AMO 都要求自然对齐（QEMU 语义：LR → load misaligned，
+                // 其余 → store/amo misaligned）
+                if vaddr & (size as u64 - 1) != 0 {
+                    return Err((
+                        if matches!(op, AmoOp::Lr) {
+                            Exception::LoadMisaligned
+                        } else {
+                            Exception::StoreMisaligned
+                        },
+                        vaddr,
+                    ));
+                }
                 let acc = match op {
                     AmoOp::Lr => Access::Load,
                     _ => Access::Store,
                 };
                 let addr = self.translate(bus, vaddr, acc).map_err(|e| (e, vaddr))?;
-                let size = if w { 4 } else { 8 };
                 // PMP：LR 需要 R；SC/AMO 同时需要 R 和 W（按 store 汇报）
                 match op {
                     AmoOp::Lr => {
@@ -400,7 +465,7 @@ impl Cpu {
                     return Err((Exception::IllegalInstruction, raw as u64));
                 }
                 let ms = self.csr.mstatus;
-                let spp = (ms & csr::SPP) >> 11;
+                let spp = (ms & csr::SPP) >> 8;
                 self.privilege = if spp == 1 { Privilege::S } else { Privilege::U };
                 let spie = (ms & csr::SPIE) >> 5;
                 self.csr.mstatus =
@@ -429,7 +494,7 @@ impl Cpu {
                 let counters = self.counters(bus);
                 let old = self
                     .csr
-                    .read(csr_addr, &counters, self.privilege)
+                    .read(csr_addr, &counters, self.privilege, self.ext_mip)
                     .ok_or((Exception::IllegalInstruction, csr_addr as u64))?;
                 let src = if imm { rs1 as u64 } else { self.reg(rs1) };
                 // CSRRS/CSRRC 在源为 x0（或 zimm=0）时不写
@@ -480,7 +545,7 @@ impl Cpu {
         }
     }
 
-    fn read_guest_mem(bus: &Bus, buf: u64, len: u64) -> Option<Vec<u8>> {
+    fn read_guest_mem(bus: &mut Bus, buf: u64, len: u64) -> Option<Vec<u8>> {
         let mut bytes = Vec::with_capacity(len as usize);
         for i in 0..len {
             let addr = buf.checked_add(i)?;
@@ -581,7 +646,7 @@ impl Cpu {
 
     /// 有挂起且使能的中断时注入并返回 true（由运行循环在指令间调用）。
     pub fn take_pending_interrupt(&mut self) -> bool {
-        let pending = self.csr.mip & self.csr.mie;
+        let pending = (self.csr.mip | self.ext_mip) & self.csr.mie;
         if pending == 0 {
             return false;
         }
@@ -647,7 +712,7 @@ impl Cpu {
             self.csr.stval = val;
             self.csr.mstatus = (ms & !(csr::SIE | csr::SPIE | csr::SPP))
                 | (sie << 4) // SPIE <- SIE
-                | (((self.privilege == Privilege::S) as u64) << 11); // SPP
+                | (((self.privilege == Privilege::S) as u64) << 8); // SPP
             self.privilege = Privilege::S;
             self.pc = trap_target(self.csr.stvec, cause, interrupt);
         } else {

@@ -5,6 +5,8 @@ use std::time::Instant;
 /// mtimecmp 可写但暂不产生定时器中断（后续特权级支持时补上）。
 pub struct Clint {
     pub mtimecmp: u64,
+    /// msip hart 0（CLINT 偏移 0x0000）：软件中断，运行循环同步到 mip.MSIP
+    pub msip: bool,
     start: Instant,
 }
 
@@ -20,6 +22,7 @@ impl Clint {
     pub fn new() -> Self {
         Clint {
             mtimecmp: 0,
+            msip: false,
             start: Instant::now(),
         }
     }
@@ -41,6 +44,7 @@ impl Clint {
     /// size 字节的读取，offset 以 CLINT 基址为原点。
     pub fn load(&self, off: u64, size: u32) -> u64 {
         let qword = match off & !7 {
+            0x0000 => self.msip as u64, // msip hart0：bit0 有效
             0x4000 => self.mtimecmp,
             0xBFF8 => self.mtime(),
             _ => 0,
@@ -51,14 +55,18 @@ impl Clint {
     }
 
     pub fn store(&mut self, off: u64, size: u32, val: u64) {
-        if off & !7 == 0x4000 {
-            let shift = (off & 7) * 8;
-            let mask = if size >= 8 {
-                u64::MAX
-            } else {
-                (1u64 << (size * 8)) - 1
-            } << shift;
-            self.mtimecmp = (self.mtimecmp & !mask) | ((val << shift) & mask);
+        match off & !7 {
+            0x0000 => self.msip = val & 1 != 0,
+            0x4000 => {
+                let shift = (off & 7) * 8;
+                let mask = if size >= 8 {
+                    u64::MAX
+                } else {
+                    (1u64 << (size * 8)) - 1
+                } << shift;
+                self.mtimecmp = (self.mtimecmp & !mask) | ((val << shift) & mask);
+            }
+            _ => {}
         }
     }
 }
