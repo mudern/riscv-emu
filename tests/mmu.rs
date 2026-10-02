@@ -52,7 +52,10 @@ fn satp() -> u64 {
 }
 
 fn tr(bus: &mut Bus, va: u64, acc: Access, priv_: Privilege, mxr: bool, sum: bool) -> Result<u64, Exception> {
-    mmu::translate(bus, satp(), priv_, mxr, sum, va, acc)
+    let mut pmp = riscv_emu::pmp::Pmp::default();
+    pmp.write_cfg(0, riscv_emu::pmp::CFG_A_NAPOT | riscv_emu::pmp::CFG_R | riscv_emu::pmp::CFG_W | riscv_emu::pmp::CFG_X);
+    pmp.write_addr(0, riscv_emu::pmp::PMPADDR_MASK);
+    mmu::translate(bus, satp(), priv_, mxr, sum, va, acc, &pmp)
 }
 
 #[test]

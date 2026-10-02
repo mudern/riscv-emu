@@ -27,8 +27,11 @@ ash 交互 shell，`poweroff -f` 干净关机（宿主退出码 0）。全流程
 - Sv39 MMU：三级走表、大页（对齐检查）、U/S 权限与 SUM/MXR、A/D 位自动置位、
   直接映射 TLB（satp 写与 sfence.vma 冲刷）；跨页 misaligned 访问按两段
   分别翻译/PMP 检查；AMO 要求自然对齐（对齐 QEMU 的 misaligned 异常语义）
-- PMP：16 项规则（TOR/NA4/NAPOT）、L 锁定、非 M 态取指/读写/AMO 检查；
-  空 PMP 下 mret 进低特权级在 mret 处抛 instruction access fault（对齐 QEMU）
+- PMP（对照规范 3.7）：16 项、G=0（NA4 支持）、PA 宽 56 位 → pmpaddr
+  实现 54 位（高位 WARL 零）；first-match 按**任意字节重叠**的最低编号
+  条目裁决，未全覆盖即失败；L=1 约束所有特权级，L=0 放行 M；锁定的
+  TOR 项连带锁定 pmpaddr[i-1]；写入规范化（保留位零、R=0&W=1 → W=0）；
+  走表访问（PTE 读/A-D 写）以 S 态过 PMP，拒绝时报原始类型 access fault（对齐 QEMU）
 - 中断：CLINT mtime/mtimecmp（MTIP）与 msip（MSIP）；PLIC（96 源、3 位
   优先级、M/S 双 context、阈值/claim/complete、挂起锁存与网关占用语义对齐
   QEMU）；mip 硬件线（MTIP/MSIP/MEIP/SEIP）由运行循环同步，SEIP 与软件位
@@ -41,9 +44,17 @@ ash 交互 shell，`poweroff -f` 干净关机（宿主退出码 0）。全流程
   fw_dynamic_info（v2 结构）；固件支持 ELF 与裸二进制（QEMU 默认的
   fw_dynamic.bin 即裸二进制装到 0x8000_0000）；FDT 按 QEMU 规则放 RAM 顶
   2MB 对齐处
-- CSR 面：mcounteren/scounteren（U/S 计数器访问权限）、mcountinhibit、
-  menvcfg/senvcfg、fcsr/fflags/frm（受 mstatus.FS 门控）；mstatus.FS
-  Off/Initial/Clean/Dirty 跟踪；misa = RV64 IMA F D C S U
+- CSR 面（对照特权规范 1.13 逐条审查）：
+  - mip 写掩码 = SSIP|STIP/SEIP（stimecmp 未实现时恒可写），MSIP/MTIP/
+    MEIP 只读由 CLINT/PLIC 驱动；sip/sie 可见与可写位 = mideleg 委派子集；
+    CSRRS/CSRRC 对 mip/sip 的 RMW 只使用软件位（PLIC 信号不参与）
+  - WARL 写入规范化：satp（不支持 MODE 整体无效；ASID 16 位/PPN 44 位）、
+    mtvec/stvec（BASE 对齐 + MODE 仅 direct/vectored）、medeleg（排除
+    ecall-M 与保留位）、mideleg（仅 S 中断源）、MPP（保留值 2→U）、
+    mcountinhibit（CY/TM/IR）、mepc[0]=0
+  - TVM=1 时 S 态读/写 satp 均 illegal；mcycle/minstret M 态可写、独立
+    计数、受 mcountinhibit.CY/IR 抑制；mcounteren/scounteren 访问门控
+  - mstatus.SD 只读合成（FS=Dirty 时置 1）；misa 可写并按格式门控 F/D
 - 内存布局对齐 QEMU `virt` 机器：
 
   | 区域 | 范围 | 说明 |
@@ -222,6 +233,7 @@ initramfs/       内嵌 initramfs：清单、/init、busybox 静态二进制、s
 tests/
   common/        最小指令编码器 + 裸机程序装配器
   spec.rs        规范一致性回归（每项对应一次审查发现的偏差）
+  csr_matrix.rs  CSR 指令六形式矩阵 + WARL 探测 + trap 现场 + 计数器抑制
   bare_metal.rs  手工编码指令的集成测试（ALU/乘法/AMO/压缩指令/trap/ecall）
   priv.rs        特权级切换、委托、ecall 陷阱
   mmu.rs         Sv39 翻译单元测试（大页/权限/SUM/MXR/A-D 位）

@@ -250,7 +250,7 @@ fn satp_warl_and_mepc_mask() {
     use reg::*;
 
     a.addr_of(T3, RESULTS as i32);
-    // satp = 全 1 → mode 0xF→0，PPN 截 44 位 = 0xF_FFFF_FFFF
+    // satp = 全 1（mode 0xF 不支持）→ 整个写入无效，保持 0
     a.emit32(addi(T0, ZERO, -1));
     a.emit32(csrw(0x180, T0));
     a.emit32(csrr(T1, 0x180));
@@ -274,8 +274,8 @@ fn satp_warl_and_mepc_mask() {
     assert_eq!(m.run(10_000), Halt::Exit(34));
     assert_eq!(
         m.bus.load(DRAM_BASE + RESULTS, 8).unwrap(),
-        0x0000_000F_FFFF_FFFF,
-        "satp mode WARL=0，PPN 截 44 位"
+        0,
+        "不支持的 MODE：整个写入无效"
     );
     assert_eq!(
         m.bus.load(DRAM_BASE + RESULTS + 8, 8).unwrap(),

@@ -13,17 +13,18 @@ const S_CODE: i32 = 0x100;
 const M_HANDLER: i32 = 0x180;
 
 #[test]
-fn empty_pmp_mret_faults_at_mret() {
+fn empty_pmp_mret_faults_at_target_fetch() {
     let mut a = Asm::new();
     use reg::*;
 
     a.addr_of(T0, M_HANDLER);
     a.emit32(csrw(0x305, T0)); // mtvec
+    a.addr_of(T0, S_CODE);
+    a.emit32(csrw(0x341, T0)); // mepc = S 入口
     a.emit32(addi(T2, ZERO, 1));
     a.emit32(slli(T2, T2, 11)); // MPP = S
     a.emit32(csrs(0x300, T2));
-    let mret_pc = a.pc() as u64;
-    a.emit32(MRET); // ← 无 PMP 规则：这里应 fault
+    a.emit32(MRET); // mret 成功 → S 态 @S_CODE；取指被空 PMP 拒绝 → fault
 
     // S 出口（handler 重新 mret 的目标）：写 test 设备退出
     a.pad_to(S_CODE as usize);
@@ -54,8 +55,16 @@ fn empty_pmp_mret_faults_at_mret() {
     assert_eq!(m.run(100_000), Halt::Exit(0));
     let base = DRAM_BASE + RESULTS;
     assert_eq!(m.bus.load(base, 8).unwrap(), 1, "mcause = instruction access fault");
-    assert_eq!(m.bus.load(base + 8, 8).unwrap(), DRAM_BASE + mret_pc, "mepc = mret 的 pc");
-    assert_eq!(m.bus.load(base + 16, 8).unwrap(), 0, "mtval = 0（与 QEMU 一致）");
+    assert_eq!(
+        m.bus.load(base + 8, 8).unwrap(),
+        DRAM_BASE + S_CODE as u64,
+        "mepc = fault 的取指目标（mret 已成功返回）"
+    );
+    assert_eq!(
+        m.bus.load(base + 16, 8).unwrap(),
+        DRAM_BASE + S_CODE as u64,
+        "mtval = 取指目标的虚拟地址"
+    );
     assert_eq!(m.cpu.privilege, riscv_emu::Privilege::S);
 }
 

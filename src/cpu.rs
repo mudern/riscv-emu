@@ -6,7 +6,7 @@
 use std::io::{self, Write};
 
 use crate::bus::Bus;
-use crate::csr::{self, Counters, Csrs};
+use crate::csr::{self, Csrs};
 use crate::decode::{
     AluOp, AmoOp, BranchOp, CsrKind, Fmt, Inst, LoadOp, SystemOp, decode, decode_compressed,
 };
@@ -165,14 +165,6 @@ impl Cpu {
         }
     }
 
-    fn counters(&self, bus: &Bus) -> Counters {
-        Counters {
-            cycle: self.instret,
-            instret: self.instret,
-            time: bus.clint.mtime(),
-        }
-    }
-
     // ---- 地址翻译 ----
 
     /// 有效数据特权级（MPRV：M 态数据访问按 MPP 翻译）
@@ -195,8 +187,10 @@ impl Cpu {
         }
         let mxr = self.csr.mstatus & csr::MXR != 0;
         let sum = self.csr.mstatus & csr::SUM != 0;
+        // 走表访问也过 PMP，有效特权级为 S（规范 3.7.2）
+        let pmp = &self.csr.pmp;
         self.mmu
-            .translate(bus, self.csr.satp, eff, mxr, sum, vaddr, acc)
+            .translate(bus, self.csr.satp, eff, mxr, sum, vaddr, acc, pmp)
     }
 
     /// PMP 物理地址检查：fetch 按当前特权级、数据访问按有效特权级（MPRV）。
@@ -423,6 +417,13 @@ impl Cpu {
             return self.take_trap(cause, val);
         }
         self.instret += 1;
+        // 机器计数器（cycle 按 1 CPI 近似递增；受 mcountinhibit 抑制）
+        if self.csr.mcountinhibit & 1 == 0 {
+            self.csr.mcycle = self.csr.mcycle.wrapping_add(1);
+        }
+        if self.csr.mcountinhibit & 4 == 0 {
+            self.csr.minstret = self.csr.minstret.wrapping_add(1);
+        }
         Ok(())
     }
 
@@ -536,7 +537,7 @@ impl Cpu {
                 self.fs_mark_dirty();
             }
             Inst::Fp(op) => {
-                self.exec_fp(op)?;
+                self.exec_fp(op, raw)?;
             }
             Inst::Amo {
                 op,
@@ -583,11 +584,12 @@ impl Cpu {
                         if w {
                             v = (v as u32 as i32) as i64 as u64;
                         }
-                        self.reservation = Some(vaddr);
+                        // 预约基于物理地址（规范：预约集包含 PA）
+                        self.reservation = Some(addr);
                         self.set_reg(rd, v);
                     }
                     AmoOp::Sc => {
-                        if self.reservation == Some(vaddr) {
+                        if self.reservation == Some(addr) {
                             bus.store(addr, size, self.reg(rs2) & mask)
                                 .map_err(|e| (e, vaddr))?;
                             self.reservation = None;
@@ -663,11 +665,8 @@ impl Cpu {
                 }
                 let ms = self.csr.mstatus;
                 let mpp = (ms & csr::MPP) >> 11;
-                // 空 PMP 下返回低特权级：任何取指都会被拒，按 QEMU 在 mret 处
-                // 直接抛 instruction access fault（mtval=0）
-                if mpp != Privilege::M as u64 && self.csr.pmp.num_rules() == 0 {
-                    return Err((Exception::InstructionAccessFault, 0));
-                }
+                // 空 PMP 时低特权级取指会在下一条指令处自然触发
+                // instruction access fault（mtval = 目标 pc），无需特判
                 self.privilege = Privilege::from_bits(mpp);
                 let mpie = (ms & csr::MPIE) >> 7;
                 // 规范/QEMU：mret 退出 M 态时清 MPRV（防 M 态翻译权限泄漏）
@@ -712,20 +711,29 @@ impl Cpu {
                 rd,
                 rs1,
             } => {
-                let counters = self.counters(bus);
+                let time = bus.clint.mtime();
                 let old = self
                     .csr
-                    .read(csr_addr, &counters, self.privilege, self.ext_mip)
+                    .read(csr_addr, self.privilege, self.ext_mip, time)
                     .ok_or((Exception::IllegalInstruction, csr_addr as u64))?;
                 let src = if imm { rs1 as u64 } else { self.reg(rs1) };
                 // CSRRS/CSRRC 在源为 x0（或 zimm=0）时不写
                 if kind == CsrKind::Rw || rs1 != 0 {
-                    let new = match kind {
-                        CsrKind::Rw => src,
-                        CsrKind::Rs => old | src,
-                        CsrKind::Rc => old & !src,
-                    };
-                    if !self.csr.write(csr_addr, new, self.privilege) {
+                    // mip/sip 的 RS/RC：rd 读到的是含 PLIC 信号的 OR 视图，
+                    // 但回写只使用软件位（规范 3.1.9：控制器信号不参与 RMW）
+                    if kind != CsrKind::Rw && matches!(csr_addr, csr::csr::MIP | csr::csr::SIP) {
+                        let sw_old = if csr_addr == csr::csr::MIP {
+                            self.csr.mip
+                        } else {
+                            self.csr.mip & (self.csr.mideleg & csr::MIE_MASK)
+                        };
+                        let new = match kind {
+                            CsrKind::Rs => sw_old | src,
+                            CsrKind::Rc => sw_old & !src,
+                            _ => unreachable!(),
+                        };
+                        self.csr.write(csr_addr, new, self.privilege);
+                    } else if !self.csr.write(csr_addr, new_or_src(kind, src, old), self.privilege) {
                         return Err((Exception::IllegalInstruction, csr_addr as u64));
                     }
                     match csr_addr {
@@ -748,12 +756,12 @@ impl Cpu {
         Ok(false)
     }
 
-    /// 浮点指令执行（misa 扩展缺失或 mstatus.FS=Off 时 illegal）
-    fn exec_fp(&mut self, op: crate::decode::FOp) -> ExecResult {
+    /// 浮点指令执行（misa 扩展缺失或 mstatus.FS=Off 时 illegal，mtval=指令位型）
+    fn exec_fp(&mut self, op: crate::decode::FOp, raw: u32) -> ExecResult {
         use crate::decode::Fmt as F;
         use crate::fpu;
         if !self.fp_allowed(op.fmt()) {
-            return Err((Exception::IllegalInstruction, 0));
+            return Err((Exception::IllegalInstruction, raw as u64));
         }
         // 统一出口：写 f 寄存器/fflags 的指令置 FS=Dirty
         macro_rules! finish {
@@ -1123,6 +1131,15 @@ fn trap_target(tvec: u64, cause: u64, interrupt: bool) -> u64 {
         base + 4 * (cause & 0x1F)
     } else {
         base
+    }
+}
+
+/// CSR 写入值：RW 直接写，RS/RC 基于旧值合并
+fn new_or_src(kind: CsrKind, src: u64, old: u64) -> u64 {
+    match kind {
+        CsrKind::Rw => src,
+        CsrKind::Rs => old | src,
+        CsrKind::Rc => old & !src,
     }
 }
 

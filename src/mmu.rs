@@ -66,7 +66,19 @@ fn check_perm(
     Ok(())
 }
 
+/// 走表 PMP 拒绝时抛出的异常：按原始访问类型的 access fault
+/// （规范 3.7.2：PTE 读取被 PMP 拒绝时报原始访问的 access fault）
+fn access_fault(acc: Access) -> Exception {
+    match acc {
+        Access::Fetch => Exception::InstructionAccessFault,
+        Access::Load => Exception::LoadAccessFault,
+        Access::Store => Exception::StoreAccessFault,
+    }
+}
+
 /// 无缓存 Sv39 翻译。Bare 模式（satp.mode != Sv39）恒等映射。
+/// `pmp`：页表访问的 PMP 检查（有效特权级 S，规范 3.7.2）。
+#[allow(clippy::too_many_arguments)] // 参数即翻译上下文
 pub fn translate(
     bus: &mut Bus,
     satp: u64,
@@ -75,15 +87,17 @@ pub fn translate(
     sum: bool,
     vaddr: u64,
     acc: Access,
+    pmp: &crate::pmp::Pmp,
 ) -> Result<u64, Exception> {
     if satp >> 60 != SATP_SV39 {
         return Ok(vaddr);
     }
     check_canonical(vaddr, acc)?;
-    walk(bus, satp, mode, mxr, sum, vaddr, acc).map(|(pa, _)| pa)
+    walk(bus, satp, mode, mxr, sum, vaddr, acc, pmp).map(|(pa, _)| pa)
 }
 
 /// 三级走表：返回 (物理地址, TLB 回填项)。叶子页表项 A/D 自动置位。
+#[allow(clippy::too_many_arguments)] // 参数即翻译上下文
 fn walk(
     bus: &mut Bus,
     satp: u64,
@@ -92,8 +106,14 @@ fn walk(
     sum: bool,
     vaddr: u64,
     acc: Access,
+    pmp: &crate::pmp::Pmp,
 ) -> Result<(u64, TlbEntry), Exception> {
     let fault = page_fault(acc);
+    let afault = access_fault(acc);
+    // 规范 3.7.2：页表访问的 PMP 有效特权级为 S
+    let pmp_ok = |pa: u64, acc: crate::pmp::PmpAccess| {
+        pmp.allows(pa, 8, acc, Privilege::S)
+    };
     let vpn = [
         vaddr >> 12 & 0x1FF,
         vaddr >> 21 & 0x1FF,
@@ -103,7 +123,11 @@ fn walk(
 
     for level in (0..3).rev() {
         let pte_addr = (ppn << 12) + vpn[level] * 8; // ppn*4096 + idx*8
-        let pte = bus.load(pte_addr, 8).map_err(|_| fault)?;
+        // 隐式页表读取：PMP 拒绝 → 原始访问类型的 access fault（非 page fault）
+        if !pmp_ok(pte_addr, crate::pmp::PmpAccess::Read) {
+            return Err(afault);
+        }
+        let pte = bus.load(pte_addr, 8).map_err(|_| afault)?;
         if pte & PTE_V == 0 {
             return Err(fault);
         }
@@ -126,6 +150,10 @@ fn walk(
             // A/D 位自动置位（写回）
             let need = PTE_A | if acc == Access::Store { PTE_D } else { 0 };
             let new_pte = if pte & need != need {
+                // 隐式 PTE 写（A/D 置位）同样受 PMP 检查
+                if !pmp_ok(pte_addr, crate::pmp::PmpAccess::Write) {
+                    return Err(afault);
+                }
                 let p = pte | need;
                 let _ = bus.store(pte_addr, 8, p);
                 p
@@ -192,7 +220,9 @@ impl Mmu {
         sum: bool,
         vaddr: u64,
         acc: Access,
-    ) -> Result<u64, Exception> {        if satp >> 60 != SATP_SV39 {
+        pmp: &crate::pmp::Pmp,
+    ) -> Result<u64, Exception> {
+        if satp >> 60 != SATP_SV39 {
             return Ok(vaddr);
         }
         check_canonical(vaddr, acc)?;
@@ -204,7 +234,7 @@ impl Mmu {
             check_perm(e.flags, acc, mode, mxr, sum)?;
             return Ok((e.ppn << 12) | (vaddr & 0xFFF));
         }
-        let (pa, entry) = walk(bus, satp, mode, mxr, sum, vaddr, acc)?;
+        let (pa, entry) = walk(bus, satp, mode, mxr, sum, vaddr, acc, pmp)?;
         self.tlb[key] = Some(entry);
         Ok(pa)
     }
@@ -214,6 +244,18 @@ impl Mmu {
 mod tests {
     use super::*;
     use crate::bus::{Bus, DRAM_BASE};
+
+    fn full_pmp() -> crate::pmp::Pmp {
+        let mut p = crate::pmp::Pmp::default();
+        p.write_cfg(0, crate::pmp::CFG_A_NAPOT | crate::pmp::CFG_R | crate::pmp::CFG_W | crate::pmp::CFG_X);
+        p.write_addr(0, crate::pmp::PMPADDR_MASK);
+        p
+    }
+
+    /// 允许一切的空 PMP（测试中走表访问都在 M 态之外，需全开）
+    fn walk_pmp() -> crate::pmp::Pmp {
+        full_pmp()
+    }
 
     fn write_pte(bus: &mut Bus, addr: u64, v: u64) {
         bus.store(addr, 8, v).unwrap();
@@ -244,7 +286,8 @@ mod tests {
                 false,
                 false,
                 DRAM_BASE + 8,
-                Access::Load
+                Access::Load,
+                &walk_pmp()
             ),
             Ok(DRAM_BASE + 8)
         );
@@ -264,10 +307,72 @@ mod tests {
                 false,
                 false,
                 0x0,
-                Access::Load
+                Access::Load,
+                &walk_pmp()
             ),
             Err(Exception::LoadPageFault)
         );
+    }
+
+    #[test]
+    fn walk_pmp_deny_gives_access_fault() {
+        // 规范 3.7.2：走表访问的 PMP 有效特权级为 S；PTE 读取被 PMP 拒绝时
+        // 报原始访问类型的 access fault（而非 page fault）
+        let mut bus = Bus::new(1024 * 1024);
+        let root = DRAM_BASE + 0x10_000;
+        write_pte(&mut bus, root, ((DRAM_BASE) >> 12 << 10) | PTE_V | PTE_R);
+        let mut deny = crate::pmp::Pmp::default(); // 空 PMP：S 态全拒
+        assert_eq!(
+            translate(
+                &mut bus,
+                sv39(root),
+                Privilege::S,
+                false,
+                false,
+                0x0,
+                Access::Load,
+                &deny
+            ),
+            Err(Exception::LoadAccessFault),
+            "PTE 读取 PMP 拒绝 → load access fault"
+        );
+        assert_eq!(
+            translate(
+                &mut bus,
+                sv39(root),
+                Privilege::S,
+                false,
+                false,
+                0x0,
+                Access::Fetch,
+                &deny
+            ),
+            Err(Exception::InstructionAccessFault),
+            "取指走表被拒 → instruction access fault"
+        );
+        // A/D 置位的隐式 PTE 写被 PMP 拒绝 → access fault
+        let mut rw_no_more = crate::pmp::Pmp::default();
+        rw_no_more.write_addr(0, (root >> 2) | 0x3FF);
+        rw_no_more.write_cfg(0, crate::pmp::CFG_A_NAPOT | crate::pmp::CFG_R); // 只读
+        // 重建允许读取的规则：读取需 R ✓（已给），A/D 写需 W ✗
+        let mut bus2 = Bus::new(1024 * 1024);
+        let root2 = DRAM_BASE + 0x10_000;
+        write_pte(&mut bus2, root2, ((DRAM_BASE) >> 12 << 10) | PTE_V | PTE_R | PTE_W);
+        assert_eq!(
+            translate(
+                &mut bus2,
+                sv39(root2),
+                Privilege::S,
+                false,
+                false,
+                0x0,
+                Access::Store,
+                &rw_no_more
+            ),
+            Err(Exception::StoreAccessFault),
+            "A/D 隐式写 PMP 拒绝 → store access fault"
+        );
+        let _ = (&mut deny, &mut rw_no_more);
     }
 
     #[test]
@@ -285,7 +390,7 @@ mod tests {
             (0x8000_2000 >> 10) | PTE_V | PTE_R | (1 << 54),
         );
         assert_eq!(
-            translate(&mut bus, sv39(root), Privilege::S, false, false, va, Access::Load),
+            translate(&mut bus, sv39(root), Privilege::S, false, false, va, Access::Load, &walk_pmp()),
             Err(Exception::LoadPageFault),
             "pte[63:54] 保留位必须为 0"
         );
@@ -293,7 +398,7 @@ mod tests {
         // 非叶子 PTE 带 D 位 → fault（QEMU 同款保留检查）
         write_pte(&mut bus, root + vpn[2] * 8, ((root2() >> 12) << 10) | PTE_V | PTE_D);
         assert_eq!(
-            translate(&mut bus, sv39(root), Privilege::S, false, false, va, Access::Load),
+            translate(&mut bus, sv39(root), Privilege::S, false, false, va, Access::Load, &walk_pmp()),
             Err(Exception::LoadPageFault),
             "非叶子 PTE 的 D/A/U 位保留"
         );
@@ -313,7 +418,7 @@ mod tests {
         let satp = sv39(root);
 
         assert_eq!(
-            mmu.translate(&mut bus, satp, Privilege::S, false, false, va, Access::Load),
+            mmu.translate(&mut bus, satp, Privilege::S, false, false, va, Access::Load, &walk_pmp()),
             Ok(0x8000_2000)
         );
         // TLB 命中：删掉页表后仍可翻译
@@ -326,14 +431,15 @@ mod tests {
                 false,
                 false,
                 va,
-                Access::Store
+                Access::Store,
+                &walk_pmp()
             ),
             Ok(0x8000_2000)
         );
         // 冲刷后 fault
         mmu.flush();
         assert!(
-            mmu.translate(&mut bus, satp, Privilege::S, false, false, va, Access::Load)
+            mmu.translate(&mut bus, satp, Privilege::S, false, false, va, Access::Load, &walk_pmp())
                 .is_err()
         );
     }
@@ -348,11 +454,11 @@ mod tests {
         let mut mmu = Mmu::new();
         let satp = sv39(root);
         assert!(
-            mmu.translate(&mut bus, satp, Privilege::S, false, true, va, Access::Load)
+            mmu.translate(&mut bus, satp, Privilege::S, false, true, va, Access::Load, &walk_pmp())
                 .is_ok()
         );
         assert_eq!(
-            mmu.translate(&mut bus, satp, Privilege::S, false, false, va, Access::Load),
+            mmu.translate(&mut bus, satp, Privilege::S, false, false, va, Access::Load, &walk_pmp()),
             Err(Exception::LoadPageFault)
         );
     }
