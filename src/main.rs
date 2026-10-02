@@ -4,13 +4,14 @@ use std::process::ExitCode;
 use riscv_emu::{elf, exception::TrapInfo, machine::Halt, Machine};
 
 const USAGE: &str = "\
-用法: riscv-emu [--trace] [--stats] [--mem <MB>] [--bin] <image>
+用法: riscv-emu [--trace] [--stats] [--mem <MB>] [--bin] [--sbi] <image>
 
   <image>   RISC-V ELF64 可执行文件（静态、非 PIE），或 --bin 时的裸二进制
   --trace   打印每条指令
   --stats   退出时打印指令数和性能统计
   --mem     RAM 大小，单位 MB（默认 128）
   --bin     按裸二进制加载到 0x8000_0000
+  --sbi     S 态 ecall 按内置 SBI 处理（putchar/timer/shutdown 等），而非异常交付
 ";
 
 fn main() -> ExitCode {
@@ -19,6 +20,7 @@ fn main() -> ExitCode {
     let mut stats = false;
     let mut mem_mb: usize = 128;
     let mut flat_bin = false;
+    let mut sbi = false;
     let mut image: Option<String> = None;
 
     let mut i = 0;
@@ -27,6 +29,7 @@ fn main() -> ExitCode {
             "--trace" => trace = true,
             "--stats" => stats = true,
             "--bin" => flat_bin = true,
+            "--sbi" => sbi = true,
             "--mem" => {
                 i += 1;
                 match args.get(i).and_then(|v| v.parse().ok()) {
@@ -70,6 +73,7 @@ fn main() -> ExitCode {
 
     let mut machine = Machine::new(mem_mb);
     machine.cpu.trace = trace;
+    machine.cpu.sbi = sbi;
     let entry = if flat_bin {
         match elf::load_flat_bin(&data, &mut machine.bus) {
             Ok(e) => e,

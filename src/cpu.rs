@@ -1,134 +1,58 @@
-//! CPU hart：取指、执行、CSR 与异常交付。
-//! 阶段 1 只实现 M-mode。M-mode `ecall` 被模拟器拦截为宿主调用
-//! （Linux 风格 write=64/exit=93），方便裸机程序输出和退出。
+//! CPU hart：取指、执行、CSR 与异常交付、特权级、Sv39 翻译。
+//!
+//! 阶段 1 约定保留：M-mode `ecall` 被拦截为宿主调用（write/exit）；
+//! U/S 态 ecall 走标准异常交付。
 
 use std::io::{self, Write};
 
 use crate::bus::Bus;
+use crate::csr::{self, Counters, Csrs};
 use crate::decode::{
     AluOp, AmoOp, BranchOp, CsrKind, Inst, LoadOp, SystemOp, decode, decode_compressed,
 };
 use crate::exception::{Exception, TrapInfo};
+use crate::mmu::{self, Access, Mmu};
+use crate::pmp::PmpAccess;
 
-/// misa: RV64 IMA C
-const MISA: u64 = (2 << 62) | (1 << 0) | (1 << 2) | (1 << 8) | (1 << 12);
-
-const MSTATUS_MIE: u64 = 1 << 3;
-const MSTATUS_MPIE: u64 = 1 << 7;
-const MSTATUS_MPP_MASK: u64 = 3 << 11;
-
-/// CSR 地址
-pub mod csr {
-    pub const MSTATUS: u16 = 0x300;
-    pub const MISA: u16 = 0x301;
-    pub const MIE: u16 = 0x304;
-    pub const MTVEC: u16 = 0x305;
-    pub const MSCRATCH: u16 = 0x340;
-    pub const MEPC: u16 = 0x341;
-    pub const MCAUSE: u16 = 0x342;
-    pub const MTVAL: u16 = 0x343;
-    pub const MIP: u16 = 0x344;
-    pub const MVENDORID: u16 = 0xF11;
-    pub const MARCHID: u16 = 0xF12;
-    pub const MIMPID: u16 = 0xF13;
-    pub const MHARTID: u16 = 0xF14;
-    pub const MCYCLE: u16 = 0xB00;
-    pub const MINSTRET: u16 = 0xB02;
-    pub const CYCLE: u16 = 0xC00;
-    pub const TIME: u16 = 0xC01;
-    pub const INSTRET: u16 = 0xC02;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Privilege {
+    U = 0,
+    S = 1,
+    M = 3,
 }
 
-pub struct Counters {
-    pub cycle: u64,
-    pub instret: u64,
-    pub time: u64,
-}
-
-pub struct Csrs {
-    pub misa: u64,
-    pub mstatus: u64,
-    pub mie: u64,
-    pub mip: u64,
-    pub mtvec: u64,
-    pub mscratch: u64,
-    pub mepc: u64,
-    pub mcause: u64,
-    pub mtval: u64,
-}
-
-impl Default for Csrs {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Csrs {
-    pub fn new() -> Self {
-        Csrs {
-            misa: MISA,
-            mstatus: 0,
-            mie: 0,
-            mip: 0,
-            mtvec: 0,
-            mscratch: 0,
-            mepc: 0,
-            mcause: 0,
-            mtval: 0,
+impl Privilege {
+    pub fn from_bits(v: u64) -> Privilege {
+        match v & 3 {
+            0 => Privilege::U,
+            1 => Privilege::S,
+            _ => Privilege::M,
         }
     }
 
-    pub fn read(&self, addr: u16, c: &Counters) -> Option<u64> {
-        Some(match addr {
-            csr::MSTATUS => self.mstatus,
-            csr::MISA => self.misa,
-            csr::MIE => self.mie,
-            csr::MTVEC => self.mtvec,
-            csr::MSCRATCH => self.mscratch,
-            csr::MEPC => self.mepc,
-            csr::MCAUSE => self.mcause,
-            csr::MTVAL => self.mtval,
-            csr::MIP => self.mip,
-            csr::MVENDORID | csr::MARCHID | csr::MIMPID | csr::MHARTID => 0,
-            csr::MCYCLE | csr::CYCLE => c.cycle,
-            csr::MINSTRET | csr::INSTRET => c.instret,
-            csr::TIME => c.time,
-            _ => return None,
-        })
-    }
-
-    /// 写 CSR；对只读或未知 CSR 返回 false（触发 illegal instruction）。
-    pub fn write(&mut self, addr: u16, val: u64) -> bool {
-        match addr {
-            csr::MSTATUS => self.mstatus = val,
-            csr::MIE => self.mie = val,
-            csr::MTVEC => self.mtvec = val,
-            csr::MSCRATCH => self.mscratch = val,
-            csr::MEPC => self.mepc = val,
-            csr::MCAUSE => self.mcause = val,
-            csr::MTVAL => self.mtval = val,
-            csr::MIP => self.mip = val,
-            csr::MCYCLE | csr::MINSTRET => {} // 计数器不可写，见 execute 的判断
-            _ => return false,
+    pub fn name(self) -> &'static str {
+        match self {
+            Privilege::U => "U",
+            Privilege::S => "S",
+            Privilege::M => "M",
         }
-        true
-    }
-
-    fn writable(&self, addr: u16) -> bool {
-        !matches!(addr, csr::MISA | csr::TIME | csr::CYCLE | csr::INSTRET | csr::MCYCLE | csr::MINSTRET | csr::MVENDORID | csr::MARCHID | csr::MIMPID | csr::MHARTID)
     }
 }
 
 pub struct Cpu {
     pub regs: [u64; 32],
     pub pc: u64,
+    pub privilege: Privilege,
     pub csr: Csrs,
+    pub mmu: Mmu,
     /// LR/SC 预约地址
     pub reservation: Option<u64>,
     /// ecall exit 设置
     pub exit: Option<i32>,
     pub instret: u64,
     pub trace: bool,
+    /// 内置 SBI：开启后 S 态 ecall 不再走异常交付，而是按 SBI 调用处理
+    pub sbi: bool,
 }
 
 type ExecResult = Result<(), (Exception, u64)>;
@@ -138,11 +62,14 @@ impl Cpu {
         Cpu {
             regs: [0; 32],
             pc: entry,
-            csr: Csrs::new(),
+            privilege: Privilege::M,
+            csr: Csrs::default(),
+            mmu: Mmu::new(),
             reservation: None,
             exit: None,
             instret: 0,
             trace: false,
+            sbi: false,
         }
     }
 
@@ -164,21 +91,88 @@ impl Cpu {
         }
     }
 
-    /// 执行一条指令。返回 Err 表示无法交付的异常（guest 没有 mtvec handler）。
+    // ---- 地址翻译 ----
+
+    /// 有效数据特权级（MPRV：M 态数据访问按 MPP 翻译）
+    fn effective_data_priv(&self) -> Privilege {
+        if self.privilege == Privilege::M && self.csr.mstatus & csr::MPRV != 0 {
+            Privilege::from_bits((self.csr.mstatus & csr::MPP) >> 11)
+        } else {
+            self.privilege
+        }
+    }
+
+    fn translate(&mut self, bus: &mut Bus, vaddr: u64, acc: Access) -> Result<u64, Exception> {
+        let eff = if matches!(acc, Access::Fetch) {
+            self.privilege
+        } else {
+            self.effective_data_priv()
+        };
+        if eff == Privilege::M || (self.csr.satp >> 60) != mmu::SATP_SV39 {
+            return Ok(vaddr); // 裸地址
+        }
+        let mxr = self.csr.mstatus & csr::MXR != 0;
+        let sum = self.csr.mstatus & csr::SUM != 0;
+        self.mmu
+            .translate(bus, self.csr.satp, eff, mxr, sum, vaddr, acc)
+    }
+
+    /// PMP 物理地址检查：fetch 按当前特权级、数据访问按有效特权级（MPRV）。
+    /// 失败时 tval 记引发故障的虚拟地址。Ok 时原样返回 pa，便于链式调用。
+    /// 页表走表访问不做 PMP 检查（与 QEMU 相同）。
+    fn pmp_check(&self, pa: u64, len: u32, acc: Access, vaddr: u64) -> Result<u64, (Exception, u64)> {
+        let mode = if matches!(acc, Access::Fetch) {
+            self.privilege
+        } else {
+            self.effective_data_priv()
+        };
+        let pmp_acc = match acc {
+            Access::Fetch => PmpAccess::Exec,
+            Access::Load => PmpAccess::Read,
+            Access::Store => PmpAccess::Write,
+        };
+        if self.csr.pmp.allows(pa, len as u64, pmp_acc, mode) {
+            Ok(pa)
+        } else {
+            Err((
+                match acc {
+                    Access::Fetch => Exception::InstructionAccessFault,
+                    Access::Load => Exception::LoadAccessFault,
+                    Access::Store => Exception::StoreAccessFault,
+                },
+                vaddr,
+            ))
+        }
+    }
+
+    // ---- 执行 ----
+
+    /// 执行一条指令。返回 Err 表示无法交付的异常（guest 没有 handler）。
     pub fn step(&mut self, bus: &mut Bus, console: &mut Vec<u8>) -> Result<(), TrapInfo> {
         let pc = self.pc;
         if pc & 1 != 0 {
             return self.take_trap(Exception::InstructionMisaligned, pc);
         }
 
-        let lo = match bus.load(pc, 2) {
+        let lo = self
+            .translate(bus, pc, Access::Fetch)
+            .map_err(|e| (e, pc))
+            .and_then(|phys| self.pmp_check(phys, 2, Access::Fetch, pc))
+            .and_then(|phys| bus.load(phys, 2).map_err(|e| (e, pc)));
+        let lo = match lo {
             Ok(v) => v as u16,
-            Err(_) => return self.take_trap(Exception::InstructionAccessFault, pc),
+            Err((e, t)) => return self.take_trap(e, t),
         };
+
         let (inst, next_pc, raw) = if lo & 3 == 3 {
-            let hi = match bus.load(pc + 2, 2) {
+            let hi = self
+                .translate(bus, pc.wrapping_add(2), Access::Fetch)
+                .map_err(|e| (e, pc))
+                .and_then(|phys| self.pmp_check(phys, 2, Access::Fetch, pc))
+                .and_then(|phys| bus.load(phys, 2).map_err(|e| (e, pc)));
+            let hi = match hi {
                 Ok(v) => v as u16,
-                Err(_) => return self.take_trap(Exception::InstructionAccessFault, pc + 2),
+                Err((e, t)) => return self.take_trap(e, t),
             };
             let word = lo as u32 | (hi as u32) << 16;
             match decode(word) {
@@ -193,20 +187,20 @@ impl Cpu {
         };
 
         if self.trace {
-            println!("{pc:012x}: {raw:08x} {inst:?}");
+            println!("{pc:012x} [{}] {raw:08x} {inst:?}", self.privilege.name());
         }
 
-        if let Err((cause, val)) = self.execute(inst, pc, next_pc, bus, console) {
+        if let Err((cause, val)) = self.execute(inst, raw, pc, next_pc, bus, console) {
             return self.take_trap(cause, val);
         }
         self.instret += 1;
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
     fn execute(
         &mut self,
         inst: Inst,
+        raw: u32,
         pc: u64,
         next_pc: u64,
         bus: &mut Bus,
@@ -243,8 +237,12 @@ impl Cpu {
                 }
             }
             Inst::Load { op, rd, rs1, imm } => {
-                let addr = self.reg(rs1).wrapping_add(imm as u64);
-                let raw = bus.load(addr, op.size()).map_err(|e| (e, addr))?;
+                let vaddr = self.reg(rs1).wrapping_add(imm as u64);
+                let phys = self
+                    .translate(bus, vaddr, Access::Load)
+                    .map_err(|e| (e, vaddr))?;
+                self.pmp_check(phys, op.size(), Access::Load, vaddr)?;
+                let raw = bus.load(phys, op.size()).map_err(|e| (e, vaddr))?;
                 let val = match op {
                     LoadOp::B => (raw as u8 as i8) as i64 as u64,
                     LoadOp::Bu => raw & 0xFF,
@@ -257,15 +255,23 @@ impl Cpu {
                 self.set_reg(rd, val);
             }
             Inst::Store { op, rs1, rs2, imm } => {
-                let addr = self.reg(rs1).wrapping_add(imm as u64);
-                bus.store(addr, op.size(), self.reg(rs2))
-                    .map_err(|e| (e, addr))?;
+                let vaddr = self.reg(rs1).wrapping_add(imm as u64);
+                let phys = self
+                    .translate(bus, vaddr, Access::Store)
+                    .map_err(|e| (e, vaddr))?;
+                self.pmp_check(phys, op.size(), Access::Store, vaddr)?;
+                bus.store(phys, op.size(), self.reg(rs2))
+                    .map_err(|e| (e, vaddr))?;
             }
             Inst::OpImm { op, rd, rs1, imm } => {
                 let a = self.reg(rs1);
                 let b = match op {
-                    AluOp::Sll | AluOp::Srl | AluOp::Sra
-                    | AluOp::Sllw | AluOp::Srlw | AluOp::Sraw => (imm as u64) & 63,
+                    AluOp::Sll
+                    | AluOp::Srl
+                    | AluOp::Sra
+                    | AluOp::Sllw
+                    | AluOp::Srlw
+                    | AluOp::Sraw => (imm as u64) & 63,
                     _ => imm as u64,
                 };
                 self.set_reg(rd, alu(op, a, b));
@@ -274,20 +280,42 @@ impl Cpu {
                 let (a, b) = (self.reg(rs1), self.reg(rs2));
                 self.set_reg(rd, alu(op, a, b));
             }
-            Inst::Amo { op, w, rd, rs1, rs2 } => {
-                let addr = self.reg(rs1);
+            Inst::Amo {
+                op,
+                w,
+                rd,
+                rs1,
+                rs2,
+            } => {
+                let vaddr = self.reg(rs1);
+                let acc = match op {
+                    AmoOp::Lr => Access::Load,
+                    _ => Access::Store,
+                };
+                let addr = self.translate(bus, vaddr, acc).map_err(|e| (e, vaddr))?;
                 let size = if w { 4 } else { 8 };
+                // PMP：LR 需要 R；SC/AMO 同时需要 R 和 W（按 store 汇报）
+                match op {
+                    AmoOp::Lr => {
+                        self.pmp_check(addr, size, Access::Load, vaddr)?;
+                    }
+                    _ => {
+                        self.pmp_check(addr, size, Access::Load, vaddr)
+                            .map_err(|_| (Exception::StoreAccessFault, vaddr))?;
+                        self.pmp_check(addr, size, Access::Store, vaddr)?;
+                    }
+                }
                 let mask: u64 = if w { 0xFFFF_FFFF } else { u64::MAX };
                 match op {
                     AmoOp::Lr => {
-                        let v = bus.load(addr, size).map_err(|e| (e, addr))?;
-                        self.reservation = Some(addr);
+                        let v = bus.load(addr, size).map_err(|e| (e, vaddr))?;
+                        self.reservation = Some(vaddr);
                         self.set_reg(rd, v);
                     }
                     AmoOp::Sc => {
-                        if self.reservation == Some(addr) {
+                        if self.reservation == Some(vaddr) {
                             bus.store(addr, size, self.reg(rs2) & mask)
-                                .map_err(|e| (e, addr))?;
+                                .map_err(|e| (e, vaddr))?;
                             self.reservation = None;
                             self.set_reg(rd, 0);
                         } else {
@@ -295,7 +323,7 @@ impl Cpu {
                         }
                     }
                     _ => {
-                        let old = bus.load(addr, size).map_err(|e| (e, addr))? & mask;
+                        let old = bus.load(addr, size).map_err(|e| (e, vaddr))? & mask;
                         let b = self.reg(rs2) & mask;
                         let new = match op {
                             AmoOp::Swap => b,
@@ -309,14 +337,14 @@ impl Cpu {
                             AmoOp::Maxu => old.max(b),
                             AmoOp::Lr | AmoOp::Sc => unreachable!(),
                         };
-                        bus.store(addr, size, new).map_err(|e| (e, addr))?;
+                        bus.store(addr, size, new).map_err(|e| (e, vaddr))?;
                         self.set_reg(rd, old);
                     }
                 }
             }
             Inst::System(op) => {
-                if self.system(op, bus, console)? {
-                    return Ok(()); // pc 已由指令自身设置（如 mret）
+                if self.system(op, raw, bus, console)? {
+                    return Ok(());
                 }
             }
         }
@@ -324,46 +352,100 @@ impl Cpu {
         Ok(())
     }
 
-    /// 返回 true 表示 pc 已更新，调用方不要推进 next_pc。
-    fn system(&mut self, op: SystemOp, bus: &mut Bus, console: &mut Vec<u8>) -> Result<bool, (Exception, u64)> {
+    /// 返回 true 表示 pc 已由指令自身更新（mret/sret）。
+    fn system(
+        &mut self,
+        op: SystemOp,
+        raw: u32,
+        bus: &mut Bus,
+        console: &mut Vec<u8>,
+    ) -> Result<bool, (Exception, u64)> {
         match op {
-            SystemOp::Wfi => {} // 单核无中断源，等同 nop
+            SystemOp::Wfi => {
+                // 单 hart 且无其它事件源，等同等待一条指令；TW 置位时非 M 态执行它非法
+                if self.csr.mstatus & csr::TW != 0 && self.privilege != Privilege::M {
+                    return Err((Exception::IllegalInstruction, raw as u64));
+                }
+            }
+            SystemOp::SfenceVma => {
+                if self.privilege == Privilege::U
+                    || (self.privilege == Privilege::S && self.csr.mstatus & csr::TVM != 0)
+                {
+                    return Err((Exception::IllegalInstruction, raw as u64));
+                }
+                self.mmu.flush();
+            }
             SystemOp::Ebreak => return Err((Exception::Breakpoint, 3)),
             SystemOp::Mret => {
-                self.pc = self.csr.mepc;
                 let ms = self.csr.mstatus;
-                let mpie = (ms & MSTATUS_MPIE) >> 7;
-                self.csr.mstatus = (ms & !(MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP_MASK))
+                let mpp = (ms & csr::MPP) >> 11;
+                // 空 PMP 下返回低特权级：任何取指都会被拒，按 QEMU 在 mret 处
+                // 直接抛 instruction access fault（mtval=0）
+                if mpp != Privilege::M as u64 && self.csr.pmp.num_rules() == 0 {
+                    return Err((Exception::InstructionAccessFault, 0));
+                }
+                self.privilege = Privilege::from_bits(mpp);
+                let mpie = (ms & csr::MPIE) >> 7;
+                self.csr.mstatus = (ms & !(csr::MIE | csr::MPIE | csr::MPP))
                     | (mpie << 3)
-                    | MSTATUS_MPIE;
+                    | csr::MPIE
+                    | ((Privilege::U as u64) << 11);
+                self.pc = self.csr.mepc;
                 return Ok(true);
             }
-            SystemOp::Ecall => self.host_ecall(bus, console),
-            SystemOp::Csr { kind, imm, csr, rd, rs1 } => {
+            SystemOp::Sret => {
+                if self.privilege == Privilege::U
+                    || (self.privilege == Privilege::S && self.csr.mstatus & csr::TSR != 0)
+                {
+                    return Err((Exception::IllegalInstruction, raw as u64));
+                }
+                let ms = self.csr.mstatus;
+                let spp = (ms & csr::SPP) >> 11;
+                self.privilege = if spp == 1 { Privilege::S } else { Privilege::U };
+                let spie = (ms & csr::SPIE) >> 5;
+                self.csr.mstatus =
+                    (ms & !(csr::SIE | csr::SPIE | csr::SPP)) | (spie << 1) | csr::SPIE;
+                self.pc = self.csr.sepc;
+                return Ok(true);
+            }
+            SystemOp::Ecall => match self.privilege {
+                Privilege::M => self.host_ecall(bus, console),
+                Privilege::S => {
+                    if self.sbi {
+                        self.sbi_call(bus, console);
+                    } else {
+                        return Err((Exception::EcallFromS, 0));
+                    }
+                }
+                Privilege::U => return Err((Exception::EcallFromU, 0)),
+            },
+            SystemOp::Csr {
+                kind,
+                imm,
+                csr: csr_addr,
+                rd,
+                rs1,
+            } => {
                 let counters = self.counters(bus);
                 let old = self
                     .csr
-                    .read(csr, &counters)
-                    .ok_or((Exception::IllegalInstruction, csr as u64))?;
-                let src = if imm {
-                    rs1 as u64 // zimm
-                } else {
-                    self.reg(rs1)
-                };
+                    .read(csr_addr, &counters, self.privilege)
+                    .ok_or((Exception::IllegalInstruction, csr_addr as u64))?;
+                let src = if imm { rs1 as u64 } else { self.reg(rs1) };
                 // CSRRS/CSRRC 在源为 x0（或 zimm=0）时不写
-                if kind != CsrKind::Rw && rs1 == 0 {
-                    self.set_reg(rd, old);
-                    return Ok(false);
+                if kind == CsrKind::Rw || rs1 != 0 {
+                    let new = match kind {
+                        CsrKind::Rw => src,
+                        CsrKind::Rs => old | src,
+                        CsrKind::Rc => old & !src,
+                    };
+                    if !self.csr.write(csr_addr, new, self.privilege) {
+                        return Err((Exception::IllegalInstruction, csr_addr as u64));
+                    }
+                    if csr_addr == csr::csr::SATP {
+                        self.mmu.flush();
+                    }
                 }
-                if !self.csr.writable(csr) {
-                    return Err((Exception::IllegalInstruction, csr as u64));
-                }
-                let new = match kind {
-                    CsrKind::Rw => src,
-                    CsrKind::Rs => old | src,
-                    CsrKind::Rc => old & !src,
-                };
-                self.csr.write(csr, new);
                 self.set_reg(rd, old);
             }
         }
@@ -407,21 +489,190 @@ impl Cpu {
         Some(bytes)
     }
 
-    /// 交付异常：有 mtvec 就进 guest handler，否则作为致命错误返回。
-    fn take_trap(&mut self, cause: Exception, val: u64) -> Result<(), TrapInfo> {
-        if self.csr.mtvec == 0 {
-            return Err(TrapInfo { pc: self.pc, cause, val });
+    /// 内置 SBI（Cpu::sbi 开启）：S 态 ecall 按 SBI 规范处理。
+    /// a0=错误码，a1=返回值；调用后正常推进 pc。
+    fn sbi_call(&mut self, bus: &mut Bus, console: &mut Vec<u8>) {
+        const BASE: u64 = 0x10;
+        const TIME: u64 = 0x5449_4D45; // "TIME"
+        const IPI: u64 = 0x73_5049; //   "sPI"
+        const RFENCE: u64 = 0x5246_4E43; // "RFNC"
+        const SRST: u64 = 0x5352_5354; // "SRST"
+        const DBCN: u64 = 0x4442_434E; // "DBCN"
+
+        let (eid, fid) = (self.reg(17), self.reg(16));
+        let (a0, a1, _a2) = (self.reg(10), self.reg(11), self.reg(12));
+        let ret: (i64, u64) = match (eid, fid) {
+            // ---- legacy ----
+            (0x00, _) => {
+                bus.clint.mtimecmp = a0;
+                (0, 0)
+            } // sbi_set_timer
+            (0x01, _) => {
+                self.sbi_putc(bus, a0 as u8, console);
+                (0, 0)
+            } // console_putchar
+            (0x02, _) => (-1, 0), // console_getchar：无输入
+            (0x03, _) => (0, 0),  // clear_ipi
+            (0x04, _) => (0, 0),  // send_ipi（单 hart）
+            (0x05, _) => (0, 0),  // remote_fence_i
+            (0x08, _) => {
+                self.exit = Some(0);
+                (0, 0)
+            } // shutdown
+            // ---- BASE ----
+            (BASE, 0) => (0, 1 << 24), // sbi_spec_version：v1.0.0
+            (BASE, 1) => (0, 1),       // impl_id：1（自定）
+            (BASE, 2) => (0, 0),       // impl_version
+            (BASE, 3) => {
+                let known = matches!(a0, BASE | TIME | IPI | RFENCE | SRST | DBCN);
+                (0, known as u64)
+            } // probe_extension
+            (BASE, 4) => (0, 0),       // mvendorid
+            (BASE, 5) => (0, 0),       // marchid
+            (BASE, 6) => (0, 0),       // mimpid
+            // ---- TIME ----
+            (TIME, 0) => {
+                bus.clint.mtimecmp = a0;
+                (0, 0)
+            } // set_timer
+            // ---- IPI ----
+            (IPI, 0) => (0, 0), // send_ipi：单 hart 无操作
+            // ---- RFENCE ----
+            (RFENCE, f) if f <= 3 => {
+                self.mmu.flush();
+                (0, 0)
+            }
+            // ---- SRST ----
+            (SRST, 0) => {
+                // shutdown(0)/reboot(1) 都作正常关机
+                self.exit = Some(0);
+                (0, 0)
+            }
+            // ---- DBCN ----
+            (DBCN, 0) => {
+                // write(num_bytes, base_lo, base_hi)：物理地址
+                match Self::read_guest_mem(bus, a1, a0.min(4096)) {
+                    Some(bytes) => {
+                        for &b in &bytes {
+                            self.sbi_putc(bus, b, console);
+                        }
+                        (0, bytes.len() as u64)
+                    }
+                    None => (-2, 0), // INVALID_PARAM
+                }
+            }
+            (DBCN, 1) => (0, 0), // read：无输入
+            (DBCN, 2) => {
+                self.sbi_putc(bus, a0 as u8, console);
+                (0, 0)
+            } // write_byte
+            _ => (-3, 0),        // SBI_ERR_NOT_SUPPORTED
+        };
+        self.set_reg(10, ret.0 as u64);
+        self.set_reg(11, ret.1);
+    }
+
+    fn sbi_putc(&self, bus: &mut Bus, b: u8, console: &mut Vec<u8>) {
+        console.push(b);
+        bus.uart.write(0, b);
+    }
+
+    // ---- trap / 中断 ----
+
+    /// 有挂起且使能的中断时注入并返回 true（由运行循环在指令间调用）。
+    pub fn take_pending_interrupt(&mut self) -> bool {
+        let pending = self.csr.mip & self.csr.mie;
+        if pending == 0 {
+            return false;
         }
-        self.csr.mepc = self.pc;
-        self.csr.mcause = cause.code();
-        self.csr.mtval = val;
-        let ms = self.csr.mstatus;
-        let mie = (ms & MSTATUS_MIE) >> 3;
-        self.csr.mstatus = (ms & !(MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP_MASK))
-            | (mie << 7) // MPIE <- MIE
-            | (3 << 11); // MPP <- M
-        self.pc = self.csr.mtvec & !3;
+        // 优先级（规范推荐顺序的近似）
+        const IRQS: [(u64, u64); 6] = [
+            (csr::MEIP, 11),
+            (csr::MSIP, 3),
+            (csr::MTIP, 7),
+            (csr::SEIP, 9),
+            (csr::SSIP, 1),
+            (csr::STIP, 5),
+        ];
+        for (bit, code) in IRQS {
+            if pending & bit == 0 {
+                continue;
+            }
+            let to_s = (self.csr.mideleg >> code) & 1 == 1;
+            let enabled = if to_s {
+                // S 目标中断：M 态下不投递；S 态看 SIE；U 态总是使能
+                self.privilege < Privilege::S
+                    || (self.privilege == Privilege::S && self.csr.mstatus & csr::SIE != 0)
+            } else {
+                // M 目标中断：从更低特权级总是使能
+                self.privilege != Privilege::M || self.csr.mstatus & csr::MIE != 0
+            };
+            if enabled {
+                self.deliver_trap(self.pc, (1 << 63) | code, 0, to_s);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 交付异常：优先按 medeleg 委托到 S 态，否则进 M 态。
+    /// 没有 handler 时作为致命错误返回。
+    fn take_trap(&mut self, cause: Exception, val: u64) -> Result<(), TrapInfo> {
+        let to_s = self.privilege != Privilege::M && (self.csr.medeleg >> cause.code()) & 1 == 1;
+        if to_s && self.csr.stvec == 0 || !to_s && self.csr.mtvec == 0 {
+            return Err(TrapInfo {
+                pc: self.pc,
+                cause,
+                val,
+            });
+        }
+        self.deliver_trap(self.pc, cause.code(), val, to_s);
         Ok(())
+    }
+
+    /// 写入 trap 上下文并跳转。cause 含中断位时调用方已置位。
+    fn deliver_trap(&mut self, pc: u64, cause: u64, val: u64, to_s: bool) {
+        if self.trace {
+            println!(
+                "---- trap -> {} @ {pc:012x} cause={cause:#x} val={val:#x}",
+                if to_s { "S" } else { "M" }
+            );
+        }
+        let interrupt = cause >> 63 == 1;
+        if to_s {
+            let ms = self.csr.mstatus;
+            let sie = ms & csr::SIE;
+            self.csr.sepc = pc;
+            self.csr.scause = cause;
+            self.csr.stval = val;
+            self.csr.mstatus = (ms & !(csr::SIE | csr::SPIE | csr::SPP))
+                | (sie << 4) // SPIE <- SIE
+                | (((self.privilege == Privilege::S) as u64) << 11); // SPP
+            self.privilege = Privilege::S;
+            self.pc = trap_target(self.csr.stvec, cause, interrupt);
+        } else {
+            let ms = self.csr.mstatus;
+            let mie = ms & csr::MIE;
+            self.csr.mepc = pc;
+            self.csr.mcause = cause;
+            self.csr.mtval = val;
+            self.csr.mstatus = (ms & !(csr::MIE | csr::MPIE | csr::MPP))
+                | (mie << 4) // MPIE <- MIE
+                | ((self.privilege as u64) << 11); // MPP
+            self.privilege = Privilege::M;
+            self.pc = trap_target(self.csr.mtvec, cause, interrupt);
+        }
+    }
+}
+
+/// tvec 的入口地址：direct 模式取基址；vectored 模式下中断跳 base+4*cause，
+/// 异常仍跳基址。基址按规范取 4 字节对齐。
+fn trap_target(tvec: u64, cause: u64, interrupt: bool) -> u64 {
+    let base = tvec & !3;
+    if interrupt && (tvec & 3) == 1 {
+        base + 4 * (cause & 0x1F)
+    } else {
+        base
     }
 }
 
@@ -467,13 +718,7 @@ fn alu(op: AluOp, a: u64, b: u64) -> u64 {
                 (x % y) as u64
             }
         }
-        AluOp::Remu => {
-            if b == 0 {
-                a
-            } else {
-                a % b
-            }
-        }
+        AluOp::Remu => a.checked_rem(b).unwrap_or(a),
         AluOp::Mulw => ((a as i32).wrapping_mul(b as i32)) as i64 as u64,
         AluOp::Divw => {
             let (x, y) = (a as i32, b as i32);
@@ -499,13 +744,7 @@ fn alu(op: AluOp, a: u64, b: u64) -> u64 {
                 (x % y) as i64 as u64
             }
         }
-        AluOp::Remuw => {
-            if (b as u32) == 0 {
-                a
-            } else {
-                ((a as u32) % (b as u32)) as u64
-            }
-        }
+        AluOp::Remuw => (a as u32).checked_rem(b as u32).map_or(a, |v| v as u64),
     }
 }
 
@@ -517,7 +756,10 @@ mod tests {
     fn div_semantics() {
         assert_eq!(alu(AluOp::Div, 42, 7), 6);
         assert_eq!(alu(AluOp::Div, 42, 0), u64::MAX); // 除 0 商全 1
-        assert_eq!(alu(AluOp::Div, i64::MIN as u64, -1i64 as u64), i64::MIN as u64);
+        assert_eq!(
+            alu(AluOp::Div, i64::MIN as u64, -1i64 as u64),
+            i64::MIN as u64
+        );
         assert_eq!(alu(AluOp::Rem, 42, 0), 42); // 除 0 余数为被除数
         assert_eq!(alu(AluOp::Rem, i64::MIN as u64, -1i64 as u64), 0);
         assert_eq!(alu(AluOp::Divuw, u32::MAX as u64, 0), u64::MAX);

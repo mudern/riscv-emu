@@ -113,7 +113,9 @@ pub enum SystemOp {
     Ecall,
     Ebreak,
     Mret,
+    Sret,
     Wfi,
+    SfenceVma,
     Csr {
         kind: CsrKind,
         /// true 表示 CSRRWI/CSRRSI/CSRRCI（rs1 字段是 zimm）
@@ -406,6 +408,9 @@ pub fn decode(w: u32) -> Result<Inst, Exception> {
         0x73 => {
             // SYSTEM
             if funct3 == 0 {
+                if (w >> 25) == 0x09 {
+                    return Ok(Inst::System(SystemOp::SfenceVma)); // rs1/rs2 字段含义忽略（无 TLB）
+                }
                 if rd != 0 || rs1 != 0 {
                     return Err(Exception::IllegalInstruction);
                 }
@@ -413,6 +418,7 @@ pub fn decode(w: u32) -> Result<Inst, Exception> {
                     0 => Ok(Inst::System(SystemOp::Ecall)),
                     1 => Ok(Inst::System(SystemOp::Ebreak)),
                     0x302 => Ok(Inst::System(SystemOp::Mret)),
+                    0x102 => Ok(Inst::System(SystemOp::Sret)),
                     0x105 => Ok(Inst::System(SystemOp::Wfi)),
                     _ => Err(Exception::IllegalInstruction),
                 };
@@ -584,7 +590,7 @@ pub fn decode_compressed(h: u16) -> Result<Inst, Exception> {
                     let rd = 8 + ((h >> 7) & 7) as u8;
                     match (h >> 10) & 3 {
                         0 => Ok(Inst::OpImm {
-                            op: AluOp::Sll,
+                            op: AluOp::Srl,
                             rd,
                             rs1: rd,
                             imm: ((((h >> 12) & 1) << 5) | ((h >> 2) & 0x1F)) as i64,
@@ -859,6 +865,18 @@ mod tests {
         assert_eq!(
             decode_compressed(0x9002), // c.ebreak
             Ok(Inst::System(SystemOp::Ebreak))
+        );
+        assert_eq!(
+            decode_compressed(0x8031), // c.srli s0, 12
+            Ok(Inst::OpImm { op: AluOp::Srl, rd: 8, rs1: 8, imm: 12 })
+        );
+        assert_eq!(
+            decode_compressed(0x0516), // c.slli a0, 5
+            Ok(Inst::OpImm { op: AluOp::Sll, rd: 10, rs1: 10, imm: 5 })
+        );
+        assert_eq!(
+            decode_compressed(0x8515), // c.srai a0, 5
+            Ok(Inst::OpImm { op: AluOp::Sra, rd: 10, rs1: 10, imm: 5 })
         );
     }
 }

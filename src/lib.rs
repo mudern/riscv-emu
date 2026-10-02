@@ -5,13 +5,17 @@
 
 pub mod bus;
 pub mod cpu;
+pub mod csr;
 pub mod decode;
 pub mod devices;
 pub mod elf;
 pub mod exception;
 pub mod machine;
+pub mod mmu;
+pub mod pmp;
 
 pub use bus::{Bus, DRAM_BASE};
-pub use cpu::{Counters, Cpu, Csrs};
+pub use cpu::{Cpu, Privilege};
+pub use csr::Csrs;
 pub use exception::{Exception, TrapInfo};
 pub use machine::{Halt, Machine};

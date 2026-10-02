@@ -28,6 +28,16 @@ impl Clint {
         self.start.elapsed().as_nanos() as u64 * TIMEBASE_FREQ / 1_000_000_000
     }
 
+    /// 定时器中断是否挂起（mtime >= mtimecmp，符合硬件语义：复位后即挂起）
+    pub fn timer_pending(&self) -> bool {
+        self.mtime() >= self.mtimecmp
+    }
+
+    /// 取消挂起（写一个很远的到期时间）
+    pub fn clear_timer(&mut self) {
+        self.mtimecmp = u64::MAX;
+    }
+
     /// size 字节的读取，offset 以 CLINT 基址为原点。
     pub fn load(&self, off: u64, size: u32) -> u64 {
         let qword = match off & !7 {

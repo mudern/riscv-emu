@@ -2,6 +2,7 @@
 
 use crate::bus::Bus;
 use crate::cpu::Cpu;
+use crate::csr;
 use crate::exception::TrapInfo;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +36,19 @@ impl Machine {
     }
 
     pub fn run(&mut self, max_insts: u64) -> Halt {
-        for _ in 0..max_insts {
+        let mut remaining = max_insts;
+        while remaining > 0 {
+            // 同步 CLINT 定时器挂起位到 mip.MTIP
+            if self.bus.clint.timer_pending() {
+                self.cpu.csr.mip |= csr::MTIP;
+            } else {
+                self.cpu.csr.mip &= !csr::MTIP;
+            }
+            // 中断投递也计入预算，防止无法清除的挂起中断导致死循环
+            if self.cpu.take_pending_interrupt() {
+                remaining -= 1;
+                continue;
+            }
             if let Some(code) = self.bus.test.exit {
                 return Halt::Exit(code);
             }
@@ -46,6 +59,7 @@ impl Machine {
                 Ok(()) => {}
                 Err(t) => return Halt::Trap(t),
             }
+            remaining -= 1;
         }
         Halt::Timeout
     }

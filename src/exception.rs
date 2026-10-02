@@ -1,4 +1,4 @@
-//! RISC-V 异常（cause 编码见特权规范 Table "mcause"）。
+//! RISC-V 异常（cause 编码见特权规范 mcause/scause 表）。
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exception {
@@ -8,6 +8,12 @@ pub enum Exception {
     Breakpoint,
     LoadAccessFault,
     StoreAccessFault,
+    EcallFromU,
+    EcallFromS,
+    EcallFromM,
+    InstructionPageFault,
+    LoadPageFault,
+    StorePageFault,
 }
 
 impl Exception {
@@ -19,6 +25,12 @@ impl Exception {
             Exception::Breakpoint => 3,
             Exception::LoadAccessFault => 5,
             Exception::StoreAccessFault => 7,
+            Exception::EcallFromU => 8,
+            Exception::EcallFromS => 9,
+            Exception::EcallFromM => 11,
+            Exception::InstructionPageFault => 12,
+            Exception::LoadPageFault => 13,
+            Exception::StorePageFault => 15,
         }
     }
 
@@ -29,12 +41,18 @@ impl Exception {
             Exception::IllegalInstruction => "illegal-instruction",
             Exception::Breakpoint => "breakpoint",
             Exception::LoadAccessFault => "load-access-fault",
-            Exception::StoreAccessFault => "store-access-fault",
+            Exception::StoreAccessFault => "store/amo-access-fault",
+            Exception::EcallFromU => "ecall-from-u-mode",
+            Exception::EcallFromS => "ecall-from-s-mode",
+            Exception::EcallFromM => "ecall-from-m-mode",
+            Exception::InstructionPageFault => "instruction-page-fault",
+            Exception::LoadPageFault => "load-page-fault",
+            Exception::StorePageFault => "store/amo-page-fault",
         }
     }
 }
 
-/// 未能交付给客户机 trap handler 的异常（通常意味着 guest 没有 mtvec）。
+/// 未能交付给客户机 trap handler 的异常（guest 没有对应的 mtvec/stvec）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrapInfo {
     pub pc: u64,
