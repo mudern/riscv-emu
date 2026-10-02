@@ -126,6 +126,115 @@ fn cmp_class_minmax() {
 }
 
 #[test]
+fn overflow_window_and_inf_operands() {
+    // 精确值超出 max 但 RNE 仍落在 max 的窗口：必须报 OF 且结果按模式
+    let x = f64::MAX;
+    let y = 2f64.powi(900); // 0 < y < max 的半 ulp
+    let (r, f) = fpu::arith64(FArith::Add, x.to_bits(), y.to_bits(), Rm::RNE);
+    assert_eq!(r, f64::INFINITY.to_bits(), "精确值 > max 应给出 inf（RN）");
+    assert_eq!(f, fpu::FFLAGS_OF | fpu::FFLAGS_NX);
+
+    // RTZ 溢出 → max finite
+    let (r, f) = fpu::arith64(FArith::Add, x.to_bits(), y.to_bits(), Rm::RTZ);
+    assert_eq!(r, f64::MAX.to_bits());
+    assert_eq!(f, fpu::FFLAGS_OF | fpu::FFLAGS_NX);
+
+    // 除法真溢出
+    let (r, f) = fpu::arith64(FArith::Div, 1e308f64.to_bits(), 1e-308f64.to_bits(), Rm::RTZ);
+    assert_eq!(r, f64::MAX.to_bits());
+    assert_eq!(f, fpu::FFLAGS_OF | fpu::FFLAGS_NX);
+
+    // 无穷操作数：精确结果就是 inf，无标志（曾误报 OF）
+    let (r, f) = fpu::arith64(FArith::Add, f64::INFINITY.to_bits(), 1.0f64.to_bits(), Rm::RNE);
+    assert_eq!(r, f64::INFINITY.to_bits());
+    assert_eq!(f, 0);
+    let (r, f) = fpu::arith64(FArith::Mul, f64::INFINITY.to_bits(), 2.0f64.to_bits(), Rm::RNE);
+    assert_eq!(r, f64::INFINITY.to_bits());
+    assert_eq!(f, 0);
+}
+
+#[test]
+fn rmm_tie_side_at_power_of_two_boundary() {
+    // exact = 1 + 2^-53：1.0 上方间距 2^-52（下方是 2^-24，不对称），
+    // 2^-53 恰为上方间距之半 → 平局 {1.0, 1+2^-52}
+    let (r, _) = fpu::arith64(FArith::Add, 1.0f64.to_bits(), 2f64.powi(-53).to_bits(), Rm::RMM);
+    assert_eq!(r, (1.0f64 + 2f64.powi(-52)).to_bits(), "RMM 平局远离零（向上）");
+    // 对照：RNE 平局取偶 → 1.0
+    let (r, _) = fpu::arith64(FArith::Add, 1.0f64.to_bits(), 2f64.powi(-53).to_bits(), Rm::RNE);
+    assert_eq!(r, 1.0f64.to_bits());
+    // 下方平局：exact = 1 - 2^-54（下方间距 2^-53 之半），候选 {1-2^-53, 1.0}；
+    // 正数侧远离零 = 向上 = 1.0（验证边界下方间距不对称也判定正确）
+    let (r, _) = fpu::arith64(FArith::Add, 1.0f64.to_bits(), (-(2f64.powi(-54))).to_bits(), Rm::RMM);
+    assert_eq!(r, 1.0f64.to_bits(), "边界下方平局 RMM 取绝对值更大者 1.0");
+    // 1 - 2^-25 精确可表示（2^-25 >> 下方 ulp 2^-53）→ 原样返回
+    let (r, f) = fpu::arith64(FArith::Add, 1.0f64.to_bits(), (-(2f64.powi(-25))).to_bits(), Rm::RMM);
+    assert_eq!(r, (1.0f64 - 2f64.powi(-25)).to_bits());
+    assert_eq!(f, 0);
+}
+
+#[test]
+fn rtz_sign_of_representable_result() {
+    // RTZ 符号：可表示结果原样带符号返回
+    let (r, f) = fpu::arith64(FArith::Add, (-2f64.powi(-1074)).to_bits(), 0.0f64.to_bits(), Rm::RTZ);
+    assert_eq!(r, (-2f64.powi(-1074)).to_bits());
+    assert_eq!(f, 0);
+    // 已知限制（见 fpu.rs 头注释）：精确结果低于最小次正规数时，
+    // UF/NX 标志可能缺失（无误差残差自身下溢）；结果值仍正确。
+}
+
+#[test]
+fn cvt_i2f_all_modes_exact() {
+    // 2^63 + 2^10：f64 在 2^63 处 ulp = 2^11，半 ulp → 平局 {2^63, 2^63+2^11}
+    let v = (1u64 << 63) + (1 << 10);
+    let want_rne = ((1u64 << 63) as f64).to_bits();
+    let want_up = ((1u64 << 63) as f64 + (1u64 << 11) as f64).to_bits();
+    let (r, f) = fpu::cvt_i_to_f(v, false, false, true, Rm::RNE);
+    assert_eq!(r, want_rne, "RNE 平局取偶 → 2^63");
+    assert_eq!(f, fpu::FFLAGS_NX);
+    let (r, _) = fpu::cvt_i_to_f(v, false, false, true, Rm::RMM);
+    assert_eq!(r, want_up, "RMM 平局远离零");
+    let (r, _) = fpu::cvt_i_to_f(v, false, false, true, Rm::RTZ);
+    assert_eq!(r, want_rne, "RTZ 向零（已是最小候选）");
+    let (r, _) = fpu::cvt_i_to_f(v, false, false, true, Rm::RUP);
+    assert_eq!(r, want_up, "RUP 远离零");
+
+    // u64 → f32 尾数 24 位：2^31 + 2^7 平局
+    let v32 = (1u64 << 31) + (1 << 7);
+    let want32 = ((1u32 << 31) as f32).to_bits();
+    let want32_up = ((1u32 << 31) as f32 + (1u32 << 8) as f32).to_bits();
+    let (r, _) = fpu::cvt_i_to_f(v32, false, false, false, Rm::RNE);
+    assert_eq!(r as u32, want32, "f32 RNE 平局取偶");
+    let (r, _) = fpu::cvt_i_to_f(v32, false, false, false, Rm::RMM);
+    assert_eq!(r as u32, want32_up, "f32 RMM 远离零");
+}
+
+#[test]
+fn cvt_f2f_modes() {
+    // D→S：x = 1 + 2^-25 → f32 平局 {1.0, 1+2^-24}
+    let x = 1.0 + 2f64.powi(-25);
+    let one = 1.0f32.to_bits() as u64;
+    let one_up = 0x3F80_0001u64; // 1 + 2^-24（不可用 f32 加法构造：会先舍入）
+    let one_neg = 0x8000_0000u64 | one;
+    let one_up_neg = 0xBF80_0001u64; // -(1+2^-24)
+    let (r, _) = fpu::cvt_f_to_f(x.to_bits(), false, Rm::RNE);
+    assert_eq!(r, one, "f32 RNE 平局取偶 → 1.0");
+    let (r, _) = fpu::cvt_f_to_f(x.to_bits(), false, Rm::RMM);
+    assert_eq!(r, one_up, "f32 RMM 远离零");
+    // 负数 RTZ：向零（曾因符号盲判向下多退一步）
+    let (r, _) = fpu::cvt_f_to_f((-x).to_bits(), false, Rm::RTZ);
+    assert_eq!(r, one_neg, "负数 RTZ = -1.0");
+    let (r, _) = fpu::cvt_f_to_f((-x).to_bits(), false, Rm::RDN);
+    assert_eq!(r, one_up_neg, "负数 RDN 远离零");
+    let (r, _) = fpu::cvt_f_to_f((-x).to_bits(), false, Rm::RUP);
+    assert_eq!(r, one_neg, "负数 RUP 向零");
+    // 正数 RDN / RUP
+    let (r, _) = fpu::cvt_f_to_f(x.to_bits(), false, Rm::RDN);
+    assert_eq!(r, one, "正数 RDN 向下");
+    let (r, _) = fpu::cvt_f_to_f(x.to_bits(), false, Rm::RUP);
+    assert_eq!(r, one_up, "正数 RUP 向上");
+}
+
+#[test]
 fn muladd_single_rounding() {
     use riscv_emu::decode::FMulAdd;
     // fma 与 Rust 原生 mul_add 一致（同为正确单舍入）

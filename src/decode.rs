@@ -115,16 +115,6 @@ pub enum Fmt {
     D,
 }
 
-impl Fmt {
-    fn from_f3(funct3: u32) -> Result<Fmt, Exception> {
-        match funct3 {
-            0 => Ok(Fmt::S),
-            1 => Ok(Fmt::D),
-            _ => Err(Exception::IllegalInstruction),
-        }
-    }
-}
-
 /// R4 型（乘加）选择
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FMulAdd {
@@ -222,6 +212,31 @@ pub enum FOp {
         rd: u8,
         rs1: u8,
     },
+}
+
+impl FOp {
+    /// 指令操作的浮点格式（用于 misa.F/D 扩展存在性门控）
+    pub fn fmt(&self) -> Fmt {
+        match *self {
+            FOp::Arith { fmt, .. }
+            | FOp::MulAdd { fmt, .. }
+            | FOp::Sgnj { fmt, .. }
+            | FOp::MinMax { fmt, .. }
+            | FOp::Cmp { fmt, .. }
+            | FOp::Cvtf2i { fmt, .. }
+            | FOp::Cvti2f { fmt, .. }
+            | FOp::FmvXf { fmt, .. }
+            | FOp::FmvFx { fmt, .. }
+            | FOp::Fclass { fmt, .. } => fmt,
+            FOp::Cvtf2f { to64, .. } => {
+                if to64 {
+                    Fmt::D
+                } else {
+                    Fmt::S
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -565,8 +580,12 @@ pub fn decode(w: u32) -> Result<Inst, Exception> {
             })
         }
         0x43 | 0x47 | 0x4B | 0x4F => {
-            // FMADD/FMSUB/FNMSUB/FNMADD（R4 型）
-            let fmt = Fmt::from_f3(funct3)?;
+            // FMADD/FMSUB/FNMSUB/FNMADD（R4 型）：fmt 在 funct7 位 0，
+            // rm 在 funct3（R4 型没有 funct7 舍入字段）
+            let fmt = if funct7 & 1 == 0 { Fmt::S } else { Fmt::D };
+            if funct7 & 2 != 0 {
+                return Err(Exception::IllegalInstruction);
+            }
             let kind = match opcode {
                 0x43 => FMulAdd::Add,
                 0x47 => FMulAdd::Sub,
@@ -581,7 +600,7 @@ pub fn decode(w: u32) -> Result<Inst, Exception> {
                 rs1,
                 rs2,
                 rs3,
-                rm: (funct7 & 7) as u64,
+                rm: funct3 as u64, // R4 型的 rm 在 funct3（funct7 是 rs3<<2|fmt）
             }))
         }
         0x53 => {

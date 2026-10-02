@@ -196,8 +196,10 @@ impl Csrs {
                 _ => (self.fcsr & 0xFF) as u64,
             });
         }
+        // mstatus.SD（bit 63）只读：FS（无 V/XS）为 Dirty 时置 1
+        let sd = if (self.mstatus >> 13) & 3 == 3 { 1 << 63 } else { 0 };
         Some(match addr {
-            csr::MSTATUS => self.mstatus | (2 << 32) | (2 << 34), // SXL/UXL = 64 位
+            csr::MSTATUS => self.mstatus | sd | (2 << 32) | (2 << 34), // +SXL/UXL
             csr::MISA => self.misa,
             csr::MEDELEG => self.medeleg,
             csr::MIDELEG => self.mideleg,
@@ -208,7 +210,7 @@ impl Csrs {
             csr::MCAUSE => self.mcause,
             csr::MTVAL => self.mtval,
             csr::MIP => (self.mip | ext_mip) & MIE_MASK,
-            csr::SSTATUS => (self.mstatus & SSTATUS_MASK) | (2 << 32), // UXL = 64 位
+            csr::SSTATUS => (self.mstatus & SSTATUS_MASK) | sd | (2 << 32), // +UXL
             csr::SIE => self.mie & self.sip_writable(),
             csr::STVEC => self.stvec,
             csr::SSCRATCH => self.sscratch,
@@ -279,6 +281,18 @@ impl Csrs {
             csr::MSTATUS => {
                 self.mstatus = (self.mstatus & !MSTATUS_WRITE_MASK) | (val & MSTATUS_WRITE_MASK)
             }
+            csr::MISA => {
+                // 可写位 = 本实现支持的扩展（I M A F D C S U）；MXL 只读
+                const SUPPORTED: u64 = (1 << 0)
+                    | (1 << 2)
+                    | (1 << 3)
+                    | (1 << 5)
+                    | (1 << 8)
+                    | (1 << 12)
+                    | (1 << 18)
+                    | (1 << 20);
+                self.misa = (2 << 62) | (val & SUPPORTED);
+            }
             csr::SSTATUS => self.mstatus = (self.mstatus & !SSTATUS_MASK) | (val & SSTATUS_MASK),
             csr::MEDELEG => self.medeleg = val & 0xFFFF,
             csr::MIDELEG => self.mideleg = val & (SSIP | STIP | SEIP), // 只有 S 态中断源可委派
@@ -293,15 +307,23 @@ impl Csrs {
             }
             csr::MTVEC => self.mtvec = val,
             csr::MSCRATCH => self.mscratch = val,
-            csr::MEPC => self.mepc = val,
+            // mepc[0] 恒 0（IALIGN=16，C 扩展支持 2 字节对齐）
+            csr::MEPC => self.mepc = val & !1,
             csr::MCAUSE => self.mcause = val,
             csr::MTVAL => self.mtval = val,
             csr::STVEC => self.stvec = val,
             csr::SSCRATCH => self.sscratch = val,
-            csr::SEPC => self.sepc = val,
+            csr::SEPC => self.sepc = val & !1,
             csr::SCAUSE => self.scause = val,
             csr::STVAL => self.stval = val,
-            csr::SATP => self.satp = val,
+            // WARL：mode 仅支持 Bare(0)/Sv39(8)；PPN 44 位（Sv39 根表）
+            csr::SATP => {
+                let mode = match (val >> 60) & 0xF {
+                    8 => 8,
+                    _ => 0,
+                };
+                self.satp = ((mode as u64) << 60) | (val & 0xF_FFFF_FFFF);
+            }
             csr::SCOUNTEREN => self.scounteren = val & 0x7,
             csr::SENVCFG => self.senvcfg = val,
             csr::MCOUNTEREN => self.mcounteren = val & 0x7,

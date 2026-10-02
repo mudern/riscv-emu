@@ -58,7 +58,25 @@ pub struct Cpu {
     pub ext_mip: u64,
     /// 浮点寄存器 f0-f31（f32 以 NaN-boxing 形式存放于高 32 位）
     pub fregs: [u64; 32],
+    /// 取指页缓存：(虚拟页, 物理页, satp, 特权级, PMP 代数)。
+    /// satp 写 / sfence.vma / fence.i / PMP CSR 写时失效。
+    fetch_page: Option<(u64, u64, u64, u8, u32)>,
+    /// PMP 配置代数：PMP CSR 每次写递增，用于取指缓存失效
+    pmp_gen: u32,
+    /// 解码缓存（直接映射，按物理地址索引）
+    icache: Vec<IcacheEntry>,
 }
+
+/// 解码缓存项：tag = 物理地址，raw 用于校验（防未 fence.i 的自修改代码）
+#[derive(Clone, Copy)]
+struct IcacheEntry {
+    tag: u64,
+    raw: u32,
+    len: u8,
+    inst: crate::decode::Inst,
+}
+
+const ICACHE_LEN: usize = 1 << 14;
 
 type ExecResult = Result<(), (Exception, u64)>;
 
@@ -77,6 +95,17 @@ impl Cpu {
             sbi: false,
             ext_mip: 0,
             fregs: [0; 32],
+            fetch_page: None,
+            pmp_gen: 0,
+            icache: vec![IcacheEntry { tag: u64::MAX, raw: 0, len: 0, inst: crate::decode::Inst::Nop }; ICACHE_LEN],
+        }
+    }
+
+    /// 失效取指相关缓存（fence.i / sfence.vma / satp / PMP 写）
+    fn flush_fetch_caches(&mut self) {
+        self.fetch_page = None;
+        for e in &mut self.icache {
+            e.tag = u64::MAX;
         }
     }
 
@@ -90,9 +119,18 @@ impl Cpu {
         }
     }
 
-    /// mstatus.FS != Off（浮点可用）
+    /// mstatus.FS != Off
     fn fs_enabled(&self) -> bool {
         (self.csr.mstatus >> 13) & 3 != 0
+    }
+
+    /// 格式级浮点门控：S 指令要求 misa.F，D 指令要求 misa.D（且 FS != Off）
+    fn fp_allowed(&self, fmt: Fmt) -> bool {
+        let ext = match fmt {
+            Fmt::S => 1 << 5, // F
+            Fmt::D => 1 << 3, // D
+        };
+        self.csr.misa & ext != 0 && self.fs_enabled()
     }
 
     /// 浮点指令执行后置 FS=Dirty
@@ -249,6 +287,121 @@ impl Cpu {
         Ok(())
     }
 
+    /// take_trap 结果适配：已交付 → Ok(None)（step 结束），未交付 → Err
+    fn trap_out(r: Result<(), TrapInfo>) -> Result<Option<(Inst, u64, u32)>, TrapInfo> {
+        match r {
+            Ok(()) => Ok(None),
+            Err(t) => Err(t),
+        }
+    }
+
+    /// 取指翻译（带页缓存）。PMP 判定不缓存（同页可能跨规则边界），
+    /// 由调用方按访问宽度逐条检查。
+    fn fetch_translate(&mut self, bus: &mut Bus, pc: u64) -> Result<u64, (Exception, u64)> {
+        let page = pc & !0xFFF;
+        if let Some((vp, pp, sp, pv, g)) = self.fetch_page
+            && vp == page
+            && sp == self.csr.satp
+            && pv == self.privilege as u8
+            && g == self.pmp_gen
+        {
+            return Ok(pp | (pc & 0xFFF));
+        }
+        let pa = self
+            .translate(bus, pc, Access::Fetch)
+            .map_err(|e| (e, pc))?;
+        self.pmp_check(pa, 2, Access::Fetch, pc)?;
+        self.fetch_page = Some((
+            page,
+            pa & !0xFFF,
+            self.csr.satp,
+            self.privilege as u8,
+            self.pmp_gen,
+        ));
+        Ok(pa)
+    }
+
+    /// 取指 + 解码（页缓存 + 解码缓存）。`None` = trap 已交付（step 结束）。
+    fn fetch_decode(&mut self, bus: &mut Bus, pc: u64) -> Result<Option<(Inst, u64, u32)>, TrapInfo> {
+        // 4 字节窗口不跨页时一次读入
+        let in_page = (pc & 0xFFF) <= 0xFFC;
+        let pa = match self.fetch_translate(bus, pc) {
+            Ok(p) => p,
+            Err((e, t)) => return Self::trap_out(self.take_trap(e, t)),
+        };
+        let size = if in_page { 4 } else { 2 };
+        if let Err((e, t)) = self.pmp_check(pa, size, Access::Fetch, pc) {
+            return Self::trap_out(self.take_trap(e, t));
+        }
+        let word = match bus.load(pa, size) {
+            Ok(w) => w,
+            Err(e) => return Self::trap_out(self.take_trap(e, pc)),
+        } as u32;
+        let lo = word as u16;
+
+        // 解码缓存命中：物理地址 + 原始编码一致
+        let idx = ((pa >> 1) as usize) & (ICACHE_LEN - 1);
+        let cached = self.icache[idx];
+        if in_page {
+            if lo & 3 == 3 {
+                if cached.tag == pa && cached.raw == word && cached.len == 4 {
+                    return Ok(Some((cached.inst, pc + 4, word)));
+                }
+                match decode(word) {
+                    Ok(i) => {
+                        self.icache[idx] = IcacheEntry { tag: pa, raw: word, len: 4, inst: i };
+                        Ok(Some((i, pc + 4, word)))
+                    }
+                    Err(_) => Self::trap_out(self.take_trap(Exception::IllegalInstruction, word as u64)),
+                }
+            } else {
+                let raw = lo as u32;
+                if cached.tag == pa && cached.raw == raw && cached.len == 2 {
+                    return Ok(Some((cached.inst, pc + 2, raw)));
+                }
+                match decode_compressed(lo) {
+                    Ok(i) => {
+                        self.icache[idx] = IcacheEntry { tag: pa, raw, len: 2, inst: i };
+                        Ok(Some((i, pc + 2, raw)))
+                    }
+                    Err(_) => Self::trap_out(self.take_trap(Exception::IllegalInstruction, lo as u64)),
+                }
+            }
+        } else {
+            // 页尾：跨页的 32 位指令走慢路径（第二段单独翻译）
+            if lo & 3 != 3 {
+                let raw = lo as u32;
+                if cached.tag == pa && cached.raw == raw && cached.len == 2 {
+                    return Ok(Some((cached.inst, pc + 2, raw)));
+                }
+                match decode_compressed(lo) {
+                    Ok(i) => {
+                        self.icache[idx] = IcacheEntry { tag: pa, raw, len: 2, inst: i };
+                        Ok(Some((i, pc + 2, raw)))
+                    }
+                    Err(_) => Self::trap_out(self.take_trap(Exception::IllegalInstruction, lo as u64)),
+                }
+            } else {
+                let pa2 = match self.fetch_translate(bus, pc.wrapping_add(2)) {
+                    Ok(p) => p,
+                    Err((e, t)) => return Self::trap_out(self.take_trap(e, t)),
+                };
+                if let Err((e, t)) = self.pmp_check(pa2, 2, Access::Fetch, pc) {
+                    return Self::trap_out(self.take_trap(e, t));
+                }
+                let hi = match bus.load(pa2, 2) {
+                    Ok(h) => h as u16,
+                    Err(e) => return Self::trap_out(self.take_trap(e, pc)),
+                };
+                let word = lo as u32 | (hi as u32) << 16;
+                match decode(word) {
+                    Ok(i) => Ok(Some((i, pc + 4, word))),
+                    Err(_) => Self::trap_out(self.take_trap(Exception::IllegalInstruction, word as u64)),
+                }
+            }
+        }
+    }
+
     /// 执行一条指令。返回 Err 表示无法交付的异常（guest 没有 handler）。
     pub fn step(&mut self, bus: &mut Bus, console: &mut Vec<u8>) -> Result<(), TrapInfo> {
         let pc = self.pc;
@@ -256,36 +409,10 @@ impl Cpu {
             return self.take_trap(Exception::InstructionMisaligned, pc);
         }
 
-        let lo = self
-            .translate(bus, pc, Access::Fetch)
-            .map_err(|e| (e, pc))
-            .and_then(|phys| self.pmp_check(phys, 2, Access::Fetch, pc))
-            .and_then(|phys| bus.load(phys, 2).map_err(|e| (e, pc)));
-        let lo = match lo {
-            Ok(v) => v as u16,
-            Err((e, t)) => return self.take_trap(e, t),
-        };
-
-        let (inst, next_pc, raw) = if lo & 3 == 3 {
-            let hi = self
-                .translate(bus, pc.wrapping_add(2), Access::Fetch)
-                .map_err(|e| (e, pc))
-                .and_then(|phys| self.pmp_check(phys, 2, Access::Fetch, pc))
-                .and_then(|phys| bus.load(phys, 2).map_err(|e| (e, pc)));
-            let hi = match hi {
-                Ok(v) => v as u16,
-                Err((e, t)) => return self.take_trap(e, t),
-            };
-            let word = lo as u32 | (hi as u32) << 16;
-            match decode(word) {
-                Ok(i) => (i, pc + 4, word),
-                Err(_) => return self.take_trap(Exception::IllegalInstruction, word as u64),
-            }
-        } else {
-            match decode_compressed(lo) {
-                Ok(i) => (i, pc + 2, lo as u32),
-                Err(_) => return self.take_trap(Exception::IllegalInstruction, lo as u64),
-            }
+        let (inst, next_pc, raw) = match self.fetch_decode(bus, pc) {
+            Ok(Some(v)) => v,
+            Ok(None) => return Ok(()), // trap 已交付
+            Err(t) => return Err(t),
         };
 
         if self.trace {
@@ -309,7 +436,10 @@ impl Cpu {
         console: &mut Vec<u8>,
     ) -> ExecResult {
         match inst {
-            Inst::Nop | Inst::Fence | Inst::FenceI => {}
+            Inst::Nop | Inst::Fence => {}
+            Inst::FenceI => {
+                self.flush_fetch_caches(); // 自修改代码：fence.i 后重取
+            }
             Inst::Lui { rd, imm } => self.set_reg(rd, imm as u64),
             Inst::Auipc { rd, imm } => self.set_reg(rd, pc.wrapping_add(imm as u64)),
             Inst::Jal { rd, imm } => {
@@ -374,7 +504,7 @@ impl Cpu {
                 self.set_reg(rd, alu(op, a, b));
             }
             Inst::FLoad { fmt, rd, rs1, imm } => {
-                if !self.fs_enabled() {
+                if !self.fp_allowed(fmt) {
                     return Err((Exception::IllegalInstruction, raw as u64));
                 }
                 let vaddr = self.reg(rs1).wrapping_add(imm as u64);
@@ -390,7 +520,7 @@ impl Cpu {
                 self.fs_mark_dirty();
             }
             Inst::FStore { fmt, rs1, rs2, imm } => {
-                if !self.fs_enabled() {
+                if !self.fp_allowed(fmt) {
                     return Err((Exception::IllegalInstruction, raw as u64));
                 }
                 let vaddr = self.reg(rs1).wrapping_add(imm as u64);
@@ -463,6 +593,8 @@ impl Cpu {
                             self.reservation = None;
                             self.set_reg(rd, 0);
                         } else {
+                            // 规范：失败的 SC 也必须作废预约
+                            self.reservation = None;
                             self.set_reg(rd, 1);
                         }
                     }
@@ -521,9 +653,14 @@ impl Cpu {
                     return Err((Exception::IllegalInstruction, raw as u64));
                 }
                 self.mmu.flush();
+                self.flush_fetch_caches();
             }
-            SystemOp::Ebreak => return Err((Exception::Breakpoint, 3)),
+            SystemOp::Ebreak => return Err((Exception::Breakpoint, 0)),
             SystemOp::Mret => {
+                // 规范：mret 仅 M 态可执行
+                if self.privilege != Privilege::M {
+                    return Err((Exception::IllegalInstruction, raw as u64));
+                }
                 let ms = self.csr.mstatus;
                 let mpp = (ms & csr::MPP) >> 11;
                 // 空 PMP 下返回低特权级：任何取指都会被拒，按 QEMU 在 mret 处
@@ -533,7 +670,9 @@ impl Cpu {
                 }
                 self.privilege = Privilege::from_bits(mpp);
                 let mpie = (ms & csr::MPIE) >> 7;
-                self.csr.mstatus = (ms & !(csr::MIE | csr::MPIE | csr::MPP))
+                // 规范/QEMU：mret 退出 M 态时清 MPRV（防 M 态翻译权限泄漏）
+                let mprv = if mpp != Privilege::M as u64 { csr::MPRV } else { 0 };
+                self.csr.mstatus = (ms & !(csr::MIE | csr::MPIE | csr::MPP | mprv))
                     | (mpie << 3)
                     | csr::MPIE
                     | ((Privilege::U as u64) << 11);
@@ -551,7 +690,7 @@ impl Cpu {
                 self.privilege = if spp == 1 { Privilege::S } else { Privilege::U };
                 let spie = (ms & csr::SPIE) >> 5;
                 self.csr.mstatus =
-                    (ms & !(csr::SIE | csr::SPIE | csr::SPP)) | (spie << 1) | csr::SPIE;
+                    (ms & !(csr::SIE | csr::SPIE | csr::SPP | csr::MPRV)) | (spie << 1) | csr::SPIE;
                 self.pc = self.csr.sepc;
                 return Ok(true);
             }
@@ -589,8 +728,18 @@ impl Cpu {
                     if !self.csr.write(csr_addr, new, self.privilege) {
                         return Err((Exception::IllegalInstruction, csr_addr as u64));
                     }
-                    if csr_addr == csr::csr::SATP {
-                        self.mmu.flush();
+                    match csr_addr {
+                        csr::csr::SATP => {
+                            self.mmu.flush();
+                            self.flush_fetch_caches();
+                        }
+                        // PMP 写：PMP 判定即时生效 + 取指缓存失效
+                        0x3A0 | 0x3A2 | 0x3B0..=0x3BF => {
+                            self.pmp_gen = self.pmp_gen.wrapping_add(1);
+                            self.fetch_page = None;
+                            self.flush_fetch_caches();
+                        }
+                        _ => {}
                     }
                 }
                 self.set_reg(rd, old);
@@ -599,17 +748,23 @@ impl Cpu {
         Ok(false)
     }
 
-    /// 浮点指令执行（mstatus.FS=Off 时 illegal）
+    /// 浮点指令执行（misa 扩展缺失或 mstatus.FS=Off 时 illegal）
     fn exec_fp(&mut self, op: crate::decode::FOp) -> ExecResult {
         use crate::decode::Fmt as F;
         use crate::fpu;
-        if !self.fs_enabled() {
+        if !self.fp_allowed(op.fmt()) {
             return Err((Exception::IllegalInstruction, 0));
         }
-        // 统一出口：写 f 寄存器/fflags 后置 FS=Dirty
+        // 统一出口：写 f 寄存器/fflags 的指令置 FS=Dirty
         macro_rules! finish {
             () => {
                 self.fs_mark_dirty();
+                return Ok(());
+            };
+        }
+        // 只读 FP 状态（结果写 GPR）的指令不改变 FS
+        macro_rules! finish_ro {
+            () => {
                 return Ok(());
             };
         }
@@ -689,7 +844,7 @@ impl Cpu {
                 };
                 self.set_reg(rd, r as u64);
                 self.csr.fcsr |= flags;
-                finish!();
+                finish_ro!();
             }
             crate::decode::FOp::Cvtf2i { signed, is32, fmt, rd, rs1, rm } => {
                 let mode = fpu::effective_rm(rm, self.csr.fcsr).ok_or((Exception::IllegalInstruction, 0))?;
@@ -700,7 +855,7 @@ impl Cpu {
                 let (val, flags) = fpu::cvt_f_to_i(exact, mode, signed, is32);
                 self.set_reg(rd, val);
                 self.csr.fcsr |= flags;
-                finish!();
+                finish_ro!();
             }
             crate::decode::FOp::Cvti2f { signed, src32, fmt, rd, rs1, rm } => {
                 let mode = fpu::effective_rm(rm, self.csr.fcsr).ok_or((Exception::IllegalInstruction, 0))?;
@@ -726,7 +881,7 @@ impl Cpu {
                     F::D => self.fregs[rs1 as usize],
                 };
                 self.set_reg(rd, val);
-                finish!();
+                finish_ro!();
             }
             crate::decode::FOp::FmvFx { fmt, rd, rs1 } => {
                 match fmt {
@@ -741,7 +896,7 @@ impl Cpu {
                     F::D => fpu::fclass64(self.fregs[rs1 as usize]),
                 };
                 self.set_reg(rd, val);
-                finish!();
+                finish_ro!();
             }
         }
     }
@@ -892,6 +1047,7 @@ impl Cpu {
             if pending & bit == 0 {
                 continue;
             }
+            // 委派位决定归属（QEMU：委派中断不进 M 取集，S 集在 M 态也使能）
             let to_s = (self.csr.mideleg >> code) & 1 == 1;
             let enabled = if to_s {
                 // S 目标中断：M 态下不投递；S 态看 SIE；U 态总是使能
@@ -941,7 +1097,7 @@ impl Cpu {
             self.csr.stval = val;
             self.csr.mstatus = (ms & !(csr::SIE | csr::SPIE | csr::SPP))
                 | (sie << 4) // SPIE <- SIE
-                | (((self.privilege == Privilege::S) as u64) << 8); // SPP
+                | (((self.privilege != Privilege::U) as u64) << 8); // SPP <- 非 U 即 1（含 M→S 陷阱）
             self.privilege = Privilege::S;
             self.pc = trap_target(self.csr.stvec, cause, interrupt);
         } else {

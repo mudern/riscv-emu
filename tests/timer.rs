@@ -70,9 +70,8 @@ fn s_timer_forwarded_like_opensbi() {
     // mideleg: STIP(bit5)
     a.emit32(addi(T1, ZERO, 1 << 5));
     a.emit32(csrw(0x303, T1));
-    // sie.STIP=1（mie 掩码内），sstatus.SIE=1
-    a.emit32(addi(T1, ZERO, 1 << 5));
-    a.emit32(csrw(0x104, T1)); // sie
+    // sstatus.SIE=1（sie.STIE 在 S 入口再开——避免 M 初始化窗口被
+    // 转发的 STIP 打断：委派中断在 M 态同样按 S 集使能（QEMU hsie））
     a.emit32(addi(T1, ZERO, 2));
     a.emit32(csrs(0x100, T1)); // sstatus |= SIE
     // mtvec = M handler（转发用），stvec = S handler（中断使能之前设好）
@@ -80,9 +79,12 @@ fn s_timer_forwarded_like_opensbi() {
     a.emit32(csrw(0x305, T0)); // mtvec
     a.addr_of(T0, 0x280);
     a.emit32(csrw(0x105, T0)); // stvec
-    // mtimecmp = 2000（先于使能，避免复位即挂起的中断提前触发）
-    a.emit32(lui(T0, 0x2004));
-    a.emit32(addi(T1, ZERO, 2000));
+    // mtimecmp = mtime + 2000（相对 200µs；绝对值会被墙钟 mtime 越过）
+    a.emit32(lui(T0, 0x2004)); // mtimecmp = 0x0200_4000
+    a.emit32(lui(T3, 0x200C)); // mtime = 0x0200_BFF8（0x200C000-8）
+    a.emit32(addi(T3, T3, -8));
+    a.emit32(ld(T1, T3, 0));
+    a.emit32(addi(T1, T1, 2000));
     a.emit32(sd(T1, T0, 0));
     // mie.MTIE=1（M 态自己收硬件定时器），mstatus.MIE=1
     a.emit32(addi(T1, ZERO, 0x80));
@@ -96,8 +98,10 @@ fn s_timer_forwarded_like_opensbi() {
     pmp_open_all(&mut a);
     a.emit32(MRET);
 
-    // ---- S 入口：轮询计数 ----
+    // ---- S 入口：开 sie.STIE 后轮询计数 ----
     a.pad_to(0x100);
+    a.emit32(addi(T1, ZERO, 1 << 5));
+    a.emit32(csrw(0x104, T1)); // sie.STIP=1
     a.addr_of(T4, RESULTS as i32);
     let poll = a.pc();
     a.emit32(ld(T5, T4, 0));

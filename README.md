@@ -16,6 +16,12 @@ ash 交互 shell，`poweroff -f` 干净关机（宿主退出码 0）。全流程
 - ISA：RV64IMAFDC + Zicsr + Zifencei（含完整 F/D 浮点：IEEE 语义、
   全部 5 种舍入模式、fflags 精确标志——inexact/underflow 用无误差变换
   （two-sum/FMA 残差）判定；NaN 规范化；f32 NaN-boxing）
+- 规范一致性（对照特权/非特权规范逐条审查 + QEMU 差分）：
+  mret 仅 M 态且退出时清 MPRV；SPP 记录真实前特权（M→S 陷阱 SPP=1）；
+  委派中断按 QEMU 语义归属 S 集；EBREAK mtval=0；失败 SC 作废预约；
+  mstatus.SD 只读合成；misa 可写（按格式门控 F/D）；satp/mepc WARL；
+  Sv39 保留 PTE 编码报页 fault；RMM 平局取绝对值更大候选（含 2 的幂
+  边界两侧间距不对称）；溢出窗口（RNE 舍回 max 仍报 OF）
 - 特权级：M/S/U 三级，标准 trap 交付（mtvec/stvec、vectored 模式）、
   medeleg/mideleg 委托、mret/sret、MPRV/SUM/MXR/TVM/TW/TSR
 - Sv39 MMU：三级走表、大页（对齐检查）、U/S 权限与 SUM/MXR、A/D 位自动置位、
@@ -215,6 +221,7 @@ board/           virt.dts/dtb（对齐 QEMU virt 的裁剪设备树）
 initramfs/       内嵌 initramfs：清单、/init、busybox 静态二进制、setwinsize
 tests/
   common/        最小指令编码器 + 裸机程序装配器
+  spec.rs        规范一致性回归（每项对应一次审查发现的偏差）
   bare_metal.rs  手工编码指令的集成测试（ALU/乘法/AMO/压缩指令/trap/ecall）
   priv.rs        特权级切换、委托、ecall 陷阱
   mmu.rs         Sv39 翻译单元测试（大页/权限/SUM/MXR/A-D 位）
@@ -233,13 +240,14 @@ tests/
 2. ~~PLIC~~、~~16550 RX~~、~~OpenSBI fw_dynamic 引导~~、~~F/D 浮点~~、
    ~~Linux 6.19-rc2 + busybox shell~~（阶段 3 完成 ✅）
 3. **virtio-blk**（磁盘 rootfs，替代 initramfs）/ virtio-net
-4. **性能**：指令解码缓存 / TLB 优化（当前 13 MIPS，目标 50+）
+4. **性能**：取指页缓存 + 解码缓存已落地（13 → 23 MIPS，Linux 启动
+   95s → 53s）；下一步：翻译直通缓存与执行闭包缓存
 5. 多核（SMP harts + MSWI/ACLINT）
 
 ## 测试
 
 ```sh
-cargo test            # 单元测试 + 集成测试
+cargo test            # 单元测试 + 集成测试（15 套）
 cargo clippy          # lint
 # 可选：OpenSBI 冒烟测试
 OPENSBI_FW=~/Code/source/opensbi/build/platform/generic/firmware/fw_dynamic.bin \

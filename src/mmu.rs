@@ -110,6 +110,10 @@ fn walk(
         if pte & PTE_W != 0 && pte & PTE_R == 0 {
             return Err(fault); // W 而无 R：保留编码
         }
+        // pte[63:54] 保留（Sv39 PPN 仅 44 位；我们也不实现 Svnapot/PBMT）
+        if pte >> 54 != 0 {
+            return Err(fault);
+        }
         if pte & (PTE_R | PTE_W | PTE_X) != 0 {
             // 叶子
             if level > 0 {
@@ -137,7 +141,11 @@ fn walk(
             };
             return Ok(((page_ppn << 12) | (vaddr & 0xFFF), entry));
         }
-        ppn = pte >> 10; // 非叶子：下一级
+        // 非叶子：D/A/U 位保留（QEMU 同款检查），PPN 直接作为下一级基址
+        if pte & (PTE_D | PTE_A | PTE_U) != 0 {
+            return Err(fault);
+        }
+        ppn = pte >> 10;
     }
     Err(fault) // 走到 level 0 仍是非叶子
 }
@@ -260,6 +268,39 @@ mod tests {
             ),
             Err(Exception::LoadPageFault)
         );
+    }
+
+    #[test]
+    fn reserved_pte_bits_fault() {
+        let mut bus = Bus::new(1024 * 1024);
+        let root = DRAM_BASE + 0x10_000;
+        let va = 0x4000_0000u64;
+        let vpn = [va >> 12 & 0x1FF, va >> 21 & 0x1FF, va >> 30 & 0x1FF];
+        // 位 54（保留高区）置 1 的叶子 PTE → fault
+        write_pte(&mut bus, root + vpn[2] * 8, ((root2() >> 12) << 10) | PTE_V);
+        write_pte(&mut bus, root + 0x1000 + vpn[1] * 8, ((root2() >> 12) << 10) | PTE_V);
+        write_pte(
+            &mut bus,
+            root + 0x2000 + vpn[0] * 8,
+            (0x8000_2000 >> 10) | PTE_V | PTE_R | (1 << 54),
+        );
+        assert_eq!(
+            translate(&mut bus, sv39(root), Privilege::S, false, false, va, Access::Load),
+            Err(Exception::LoadPageFault),
+            "pte[63:54] 保留位必须为 0"
+        );
+
+        // 非叶子 PTE 带 D 位 → fault（QEMU 同款保留检查）
+        write_pte(&mut bus, root + vpn[2] * 8, ((root2() >> 12) << 10) | PTE_V | PTE_D);
+        assert_eq!(
+            translate(&mut bus, sv39(root), Privilege::S, false, false, va, Access::Load),
+            Err(Exception::LoadPageFault),
+            "非叶子 PTE 的 D/A/U 位保留"
+        );
+    }
+
+    fn root2() -> u64 {
+        DRAM_BASE + 0x10_000
     }
 
     #[test]

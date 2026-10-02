@@ -4,6 +4,10 @@
 //! 舍入模式用无误差变换：two-sum（加减）/ FMA 残差（乘除平方根）给出精确
 //! 余量 e（RNE 结果 + e == 精确值），再按目标舍入模式从 (RNE 结果, e) 导出。
 //! NaN 一律规范化为规范 quiet NaN（确定性优先于载荷传播）。
+//!
+//! 已知限制：精确结果低于 f64/f32 最小次正规数（|exact| < 2^-1074 / 2^-149）
+//! 时，残差自身下溢，UF/NX 标志可能缺失（结果值与符号仍正确）。
+//! FMADD 的标志为 two-sum 链近似（除三重舍入角落外精确）。
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FArith {
@@ -45,72 +49,17 @@ pub fn rm_of(rm: u64) -> Option<Rm> {
 
 /// rm 字段 → 有效舍入模式（7 = DYN，取 fcsr.frm）
 pub fn effective_rm(rm_field: u64, fcsr: u32) -> Option<Rm> {
-    if rm_field == 7 { rm_of(((fcsr >> 5) & 7) as u64) } else { rm_of(rm_field) }
+    if rm_field == 7 {
+        rm_of(((fcsr >> 5) & 7) as u64)
+    } else {
+        rm_of(rm_field)
+    }
 }
 
 type Flags = u32;
 
 fn flags_of(nx: bool, of: bool, uf: bool) -> Flags {
     (nx as u32) | ((of as u32) << 2) | ((uf as u32) << 1)
-}
-
-/// 从 (RNE 结果, 精确残差) 按舍入模式导出最终结果与标志。
-/// s + e == 精确值，|e| ≤ 0.5 ulp(s)。s 为有限值（溢出由调用方处理）。
-fn round64(s: f64, e: f64, rm: Rm) -> (f64, Flags) {
-    if e == 0.0 {
-        return (s, 0);
-    }
-    let nx = true;
-    if s.is_infinite() {
-        let pos = s > 0.0;
-        let bits: u64 = match rm {
-            Rm::RNE | Rm::RMM => {
-                if pos { 0x7FF0_0000_0000_0000 } else { 0xFFF0_0000_0000_0000 }
-            }
-            Rm::RTZ => {
-                if pos { 0x7FEF_FFFF_FFFF_FFFF } else { 0xFFEF_FFFF_FFFF_FFFF }
-            }
-            Rm::RDN => {
-                if pos { 0x7FEF_FFFF_FFFF_FFFF } else { 0xFFF0_0000_0000_0000 }
-            }
-            Rm::RUP => {
-                if pos { 0x7FF0_0000_0000_0000 } else { 0xFFEF_FFFF_FFFF_FFFF }
-            }
-        };
-        return (f64::from_bits(bits), FFLAGS_OF | FFLAGS_NX);
-    }
-    let v = match rm {
-        Rm::RNE => s,
-        Rm::RTZ => {
-            let toward_zero = (e < 0.0) == (s > 0.0);
-            if toward_zero {
-                if s > 0.0 { s.next_down() } else { s.next_up() }
-            } else {
-                s
-            }
-        }
-        Rm::RDN => {
-            if e < 0.0 { s.next_down() } else { s }
-        }
-        Rm::RUP => {
-            if e > 0.0 { s.next_up() } else { s }
-        }
-        Rm::RMM => {
-            let gap = (s.next_up() - s).abs();
-            if e.abs() * 2.0 == gap {
-                if s > 0.0 { s.next_up() } else { s.next_down() }
-            } else {
-                s
-            }
-        }
-    };
-    finish64(v, nx)
-}
-
-fn finish64(v: f64, nx: bool) -> (f64, Flags) {
-    // 舍入到 ±0 保留符号；tiny（±0 或 subnormal）且不精确 → UF
-    let uf = nx && (v == 0.0 || v.is_subnormal());
-    (v, flags_of(nx, false, uf))
 }
 
 /// two-sum：s + e == a + b（无误差）
@@ -130,6 +79,171 @@ fn two_sum32(a: f32, b: f32) -> (f32, f32) {
     let eb = b - bb;
     let ea = a - aa;
     (s, ea + eb)
+}
+
+/// 溢出时的结果位型（IEEE：RN/RMM → ±inf，RZ → ±max，RD → +max/-inf，
+/// RU → +inf/-max）
+fn overflow64(rm: Rm, pos: bool) -> u64 {
+    match rm {
+        Rm::RNE | Rm::RMM => {
+            if pos { 0x7FF0_0000_0000_0000 } else { 0xFFF0_0000_0000_0000 }
+        }
+        Rm::RTZ => {
+            if pos { 0x7FEF_FFFF_FFFF_FFFF } else { 0xFFEF_FFFF_FFFF_FFFF }
+        }
+        Rm::RDN => {
+            if pos { 0x7FEF_FFFF_FFFF_FFFF } else { 0xFFF0_0000_0000_0000 }
+        }
+        Rm::RUP => {
+            if pos { 0x7FF0_0000_0000_0000 } else { 0xFFEF_FFFF_FFFF_FFFF }
+        }
+    }
+}
+
+fn overflow32(rm: Rm, pos: bool) -> u32 {
+    match rm {
+        Rm::RNE | Rm::RMM => {
+            if pos { 0x7F80_0000 } else { 0xFF80_0000 }
+        }
+        Rm::RTZ => {
+            if pos { 0x7F7F_FFFF } else { 0xFF7F_FFFF }
+        }
+        Rm::RDN => {
+            if pos { 0x7F7F_FFFF } else { 0xFF80_0000 }
+        }
+        Rm::RUP => {
+            if pos { 0x7F80_0000 } else { 0xFF7F_FFFF }
+        }
+    }
+}
+
+/// 从 (RNE 结果, 精确残差) 按舍入模式导出最终结果与标志。
+/// s + e == 精确值，|e| ≤ 0.5 ulp(s)。
+///
+/// 约定：
+/// - e == NaN：无误差变换在无穷操作数下失效，此时精确结果就是 s（无标志）；
+/// - e == ±∞ 或 s == ±∞：精确值溢出 → OF（含 RNE 舍回 max 的窗口：
+///   s == ±max 且 e 朝外）。
+fn round64(s: f64, e: f64, rm: Rm) -> (f64, Flags) {
+    if e == 0.0 {
+        return (s, 0);
+    }
+    if e.is_nan() {
+        return (s, 0);
+    }
+    let max = f64::MAX;
+    if s.is_infinite() || e.is_infinite() || (s == max && e > 0.0) || (s == -max && e < 0.0) {
+        let pos = if s == 0.0 { e > 0.0 } else { s > 0.0 };
+        return (f64::from_bits(overflow64(rm, pos)), FFLAGS_OF | FFLAGS_NX);
+    }
+    let nx = true;
+    let v = match rm {
+        Rm::RNE => s,
+        Rm::RTZ => {
+            // e 的符号给出精确值在 s 的哪一侧；向零 = 朝减小幅值方向
+            let toward = (e < 0.0) == (s > 0.0);
+            if toward {
+                if s > 0.0 {
+                    s.next_down()
+                } else if s < 0.0 {
+                    s.next_up()
+                } else {
+                    s
+                }
+            } else {
+                s
+            }
+        }
+        Rm::RDN => {
+            if e < 0.0 { s.next_down() } else { s }
+        }
+        Rm::RUP => {
+            if e > 0.0 { s.next_up() } else { s }
+        }
+        Rm::RMM => {
+            // 平局判定用 e 所在一侧的 ulp 间距（2 的幂边界两侧间距不同）。
+            // 平局时取绝对值更大的候选：精确值在 s 下方（e<0）时候选为
+            // {next_down, s}，在上方（e>0）时为 {s, next_up}——RNE 可能
+            // 已选远离零侧，此时保持 s 本身。
+            let side_gap = if e > 0.0 { s.next_up() - s } else { s - s.next_down() };
+            if e.abs() * 2.0 == side_gap {
+                if e < 0.0 {
+                    // 候选 {next_down, s}
+                    if s < 0.0 { s.next_down() } else { s }
+                } else {
+                    // 候选 {s, next_up}
+                    if s > 0.0 { s.next_up() } else if s < 0.0 { s } else { s.next_up() }
+                }
+            } else {
+                s
+            }
+        }
+    };
+    // 舍入到 ±0 时保留精确值的符号
+    let mut v = v;
+    if v == 0.0 {
+        let exact_neg = if s == 0.0 { e < 0.0 } else { s < 0.0 };
+        v = if exact_neg { -0.0 } else { 0.0 };
+    }
+    let uf = nx && (v == 0.0 || v.is_subnormal());
+    (v, flags_of(nx, false, uf))
+}
+
+fn round32(s: f32, e: f32, rm: Rm) -> (f32, Flags) {
+    if e == 0.0 {
+        return (s, 0);
+    }
+    if e.is_nan() {
+        return (s, 0);
+    }
+    let max = f32::MAX;
+    if s.is_infinite() || e.is_infinite() || (s == max && e > 0.0) || (s == -max && e < 0.0) {
+        let pos = if s == 0.0 { e > 0.0 } else { s > 0.0 };
+        return (f32::from_bits(overflow32(rm, pos)), FFLAGS_OF | FFLAGS_NX);
+    }
+    let nx = true;
+    let v = match rm {
+        Rm::RNE => s,
+        Rm::RTZ => {
+            let toward = (e < 0.0) == (s > 0.0);
+            if toward {
+                if s > 0.0 {
+                    s.next_down()
+                } else if s < 0.0 {
+                    s.next_up()
+                } else {
+                    s
+                }
+            } else {
+                s
+            }
+        }
+        Rm::RDN => {
+            if e < 0.0 { s.next_down() } else { s }
+        }
+        Rm::RUP => {
+            if e > 0.0 { s.next_up() } else { s }
+        }
+        Rm::RMM => {
+            let side_gap = if e > 0.0 { s.next_up() - s } else { s - s.next_down() };
+            if e.abs() * 2.0 == side_gap {
+                if e < 0.0 {
+                    if s < 0.0 { s.next_down() } else { s }
+                } else {
+                    if s > 0.0 { s.next_up() } else if s < 0.0 { s } else { s.next_up() }
+                }
+            } else {
+                s
+            }
+        }
+    };
+    let mut v = v;
+    if v == 0.0 {
+        let exact_neg = if s == 0.0 { e < 0.0 } else { s < 0.0 };
+        v = if exact_neg { -0.0 } else { 0.0 };
+    }
+    let uf = nx && (v == 0.0 || v.is_subnormal());
+    (v, flags_of(nx, false, uf))
 }
 
 /// f64 算术（位型输入输出）
@@ -152,6 +266,11 @@ pub fn arith64(op: FArith, a: u64, b: u64, rm: Rm) -> (u64, Flags) {
                 return (CANON_F64, FFLAGS_NV); // inf/inf
             }
             let q = x / y;
+            if q.is_infinite() {
+                // 真溢出（x、y 有限）：IEEE 溢出结果表
+                let pos = (a ^ b) & 0x8000_0000_0000_0000 == 0;
+                return (overflow64(rm, pos), FFLAGS_OF | FFLAGS_NX);
+            }
             let e = (-q).mul_add(y, x); // 精确残差
             let (v, flags) = round64(q, e, rm);
             (v.to_bits(), flags)
@@ -161,6 +280,9 @@ pub fn arith64(op: FArith, a: u64, b: u64, rm: Rm) -> (u64, Flags) {
                 return (CANON_F64, FFLAGS_NV);
             }
             let r = x.sqrt();
+            if r.is_infinite() {
+                return (r.to_bits(), 0); // sqrt(+inf) 精确
+            }
             let e = (-r).mul_add(r, x);
             let (v, flags) = round64(r, e, rm);
             (v.to_bits(), flags)
@@ -205,6 +327,10 @@ pub fn arith32(op: FArith, a: u32, b: u32, rm: Rm) -> (u32, Flags) {
                 return (CANON_F32 as u32, FFLAGS_NV);
             }
             let q = x / y;
+            if q.is_infinite() {
+                let pos = (a ^ b) & 0x8000_0000 == 0;
+                return (overflow32(rm, pos), FFLAGS_OF | FFLAGS_NX);
+            }
             let e = (-q).mul_add(y, x);
             let (v, flags) = round32(q, e, rm);
             (v.to_bits(), flags)
@@ -214,6 +340,9 @@ pub fn arith32(op: FArith, a: u32, b: u32, rm: Rm) -> (u32, Flags) {
                 return (CANON_F32 as u32, FFLAGS_NV);
             }
             let r = x.sqrt();
+            if r.is_infinite() {
+                return (r.to_bits(), 0);
+            }
             let e = (-r).mul_add(r, x);
             let (v, flags) = round32(r, e, rm);
             (v.to_bits(), flags)
@@ -238,59 +367,8 @@ pub fn arith32(op: FArith, a: u32, b: u32, rm: Rm) -> (u32, Flags) {
     }
 }
 
-fn round32(s: f32, e: f32, rm: Rm) -> (f32, Flags) {
-    if e == 0.0 {
-        return (s, 0);
-    }
-    let nx = true;
-    if s.is_infinite() {
-        let pos = s > 0.0;
-        let bits: u32 = match rm {
-            Rm::RNE | Rm::RMM => {
-                if pos { 0x7F80_0000 } else { 0xFF80_0000 }
-            }
-            Rm::RTZ => {
-                if pos { 0x7F7F_FFFF } else { 0xFF7F_FFFF }
-            }
-            Rm::RDN => {
-                if pos { 0x7F7F_FFFF } else { 0xFF80_0000 }
-            }
-            Rm::RUP => {
-                if pos { 0x7F80_0000 } else { 0xFF7F_FFFF }
-            }
-        };
-        return (f32::from_bits(bits), FFLAGS_OF | FFLAGS_NX);
-    }
-    let v = match rm {
-        Rm::RNE => s,
-        Rm::RTZ => {
-            let toward_zero = (e < 0.0) == (s > 0.0);
-            if toward_zero {
-                if s > 0.0 { s.next_down() } else { s.next_up() }
-            } else {
-                s
-            }
-        }
-        Rm::RDN => {
-            if e < 0.0 { s.next_down() } else { s }
-        }
-        Rm::RUP => {
-            if e > 0.0 { s.next_up() } else { s }
-        }
-        Rm::RMM => {
-            let gap = (s.next_up() - s).abs();
-            if e.abs() * 2.0 == gap {
-                if s > 0.0 { s.next_up() } else { s.next_down() }
-            } else {
-                s
-            }
-        }
-    };
-    let uf = nx && (v == 0.0 || v.is_subnormal());
-    (v, flags_of(nx, false, uf))
-}
-
-/// 乘加（单舍入）：±(a*b ± c)
+/// 乘加（单舍入）：±(a*b ± c)。结果值精确（Rust fma 正确舍入）；
+/// 标志用 two-sum 链近似（除三重舍入角落外精确）。
 pub fn muladd64(kind: crate::decode::FMulAdd, a: u64, b: u64, c: u64, rm: Rm) -> (u64, Flags) {
     let (x, y, z) = (f64::from_bits(a), f64::from_bits(b), f64::from_bits(c));
     if x.is_nan() || y.is_nan() || z.is_nan() {
@@ -305,27 +383,28 @@ pub fn muladd64(kind: crate::decode::FMulAdd, a: u64, b: u64, c: u64, rm: Rm) ->
     if matches!(kind, K::NAddNeg) {
         r = -r;
     }
-    // 残差（近似，一阶）：exact = x*y + addend_signed
+    if r.is_infinite() {
+        // 真溢出
+        let pos = !r.is_sign_negative();
+        return (overflow64(rm, pos), FFLAGS_OF | FFLAGS_NX);
+    }
+    // 残差：exact = (p + pe) + z，p = fl(x*y)，pe = x*y - p 精确
     let (p, pe) = {
         let p = x * y;
-        let e = x.mul_add(y, -p);
-        (p, e)
+        (p, x.mul_add(y, -p))
     };
-    let (s, e) = two_sum64(
-        match kind {
-            K::NAddNeg => -p,
-            _ => p,
-        },
-        match kind {
-            K::NAddNeg => -z,
-            _ => z,
-        },
-    );
-    let _ = pe;
-    // s + e 为精确乘加结果；RNE 已在 r
-    let _ = s;
-    let e2 = s - r; // 近似修正量
-    let e_total = e + e2;
+    let z_eff = match kind {
+        K::NAddNeg => -z,
+        _ => z,
+    };
+    let (s1, e1) = two_sum64(p, z_eff);
+    let r_eff = match kind {
+        K::NAddNeg => -r,
+        _ => r,
+    };
+    let (b, _be) = two_sum64(s1 - r_eff, e1);
+    let (c, ce) = two_sum64(b, pe);
+    let e_total = c + ce;
     let (v, flags) = round64(r, e_total, rm);
     (v.to_bits(), flags)
 }
@@ -344,22 +423,26 @@ pub fn muladd32(kind: crate::decode::FMulAdd, a: u32, b: u32, c: u32, rm: Rm) ->
     if matches!(kind, K::NAddNeg) {
         r = -r;
     }
-    let (p, _pe) = {
+    if r.is_infinite() {
+        let pos = !r.is_sign_negative();
+        return (overflow32(rm, pos) as u64, FFLAGS_OF | FFLAGS_NX);
+    }
+    let (p, pe) = {
         let p = x * y;
-        let e = x.mul_add(y, -p);
-        (p, e)
+        (p, x.mul_add(y, -p))
     };
-    let (s, e) = two_sum32(
-        match kind {
-            K::NAddNeg => -p,
-            _ => p,
-        },
-        match kind {
-            K::NAddNeg => -z,
-            _ => z,
-        },
-    );
-    let e_total = e + (s - r);
+    let z_eff = match kind {
+        K::NAddNeg => -z,
+        _ => z,
+    };
+    let (s1, e1) = two_sum32(p, z_eff);
+    let r_eff = match kind {
+        K::NAddNeg => -r,
+        _ => r,
+    };
+    let (b, _be) = two_sum32(s1 - r_eff, e1);
+    let (c, ce) = two_sum32(b, pe);
+    let e_total = c + ce;
     let (v, flags) = round32(r, e_total, rm);
     (v.to_bits() as u64, flags)
 }
@@ -511,17 +594,11 @@ pub fn cvt_f_to_i(x: f64, rm: Rm, signed: bool, is32: bool) -> (u64, Flags) {
     } else {
         (0, u64::MAX as i128)
     };
-    // 先做范围预判（f64 边界精确）
-    let ulo = if signed && !is32 { hi + 1 } else { lo }; // signed i64 上界开区间 2^63
-    let _ = ulo;
-    let out_of_range_hi = if signed && !is32 {
-        x >= hi as f64 // x >= 2^63 必越界（2^63 可精确表示）
-    } else {
-        x > hi as f64 && !(hi as f64 == x && !signed)
-    };
-    let out_of_range_lo = x < lo as f64;
-    if out_of_range_hi || out_of_range_lo {
-        let sat: u64 = if out_of_range_lo {
+    // 范围预判（f64 边界精确；i64 上界 2^63 开区间）
+    let out_hi = if signed && !is32 { x >= hi as f64 } else { x > hi as f64 };
+    let out_lo = x < lo as f64;
+    if out_hi || out_lo {
+        let sat: u64 = if out_lo {
             if signed { i64::MIN as u64 } else { 0 }
         } else if signed {
             if is32 { i32::MAX as i64 as u64 } else { i64::MAX as u64 }
@@ -553,24 +630,16 @@ pub fn cvt_f_to_i(x: f64, rm: Rm, signed: bool, is32: bool) -> (u64, Flags) {
         }
         Rm::RNE => {
             let af = frac.abs();
-            if af > 0.5 {
-                (t + af.signum() * 1.0) as i128
-            } else if af < 0.5 {
-                t as i128
+            if af > 0.5 || (af == 0.5 && (t as i64) % 2 != 0) {
+                (t + af.signum()) as i128 // 超半取远，平局取偶
             } else {
-                // 平局取偶
-                let even = (t as i64) % 2 == 0;
-                if even {
-                    t as i128
-                } else {
-                    (t + af.signum() * 1.0) as i128
-                }
+                t as i128
             }
         }
         Rm::RMM => {
             let af = frac.abs();
             if af >= 0.5 {
-                (t + af.signum() * 1.0) as i128
+                (t + af.signum()) as i128
             } else {
                 t as i128
             }
@@ -590,136 +659,110 @@ pub fn cvt_f_to_i(x: f64, rm: Rm, signed: bool, is32: bool) -> (u64, Flags) {
     (val, 0)
 }
 
-/// FCVT：整数 → 浮点
+/// FCVT：整数 → 浮点。幅值 + 符号分离法：高位整数部分 + 低位余量，
+/// 五种舍入模式全部精确（平局判定无 f64 表示误差）。
 pub fn cvt_i_to_f(v: u64, signed: bool, src32: bool, to64: bool, rm: Rm) -> (u64, Flags) {
-    let exact: f64 = if src32 {
+    let (neg, mag): (bool, u64) = if src32 {
         if signed {
-            (v as u32) as i32 as f64
+            let x = v as u32 as i32;
+            (x < 0, x.unsigned_abs() as u64)
         } else {
-            (v as u32) as f64
+            (false, v as u32 as u64)
         }
     } else if signed {
-        (v as i64) as f64
+        let x = v as i64;
+        (x < 0, x.unsigned_abs())
     } else {
-        v as f64
+        (false, v)
     };
-    // 精确性：整数有效位超出目标格式尾数（f32=24 / f64=53）时舍入
-    let mantissa_bits = if to64 { 53 } else { 24 };
-    let nx = if src32 {
-        // i32/u32 最多 32 位有效位：u32 大数 → f32 可能舍入
-        let bits = 32 - (v as u32).leading_zeros();
-        bits > mantissa_bits && (v & ((1u64 << (bits - mantissa_bits)) - 1)) != 0
+    let mant = if to64 { 53 } else { 24 };
+    let bits = 64 - mag.leading_zeros(); // mag == 0 → 0
+    let (result, nx): (f64, bool) = if bits <= mant {
+        let m = mag as f64;
+        (if neg { -m } else { m }, false)
     } else {
-        let mag = if signed {
-            (v as i64).unsigned_abs()
-        } else {
-            v
-        };
-        if mag == 0 {
-            false
-        } else {
-            let bits = 64 - mag.leading_zeros();
-            bits > mantissa_bits && (mag & ((1u64 << (bits - mantissa_bits)) - 1)) != 0
-        }
-    };
-    let (r32, r64): (f32, f64) = match rm {
-        Rm::RNE => (exact as f32, exact),
-        Rm::RTZ => {
-            if nx {
-                // 向零：先 RNE 再修正（exact 为正时 RNE 可能偏大）
-                let s = exact as f32;
-                let s = if (s as f64) > exact {
-                    s.next_down()
-                } else if (s as f64) < exact {
-                    s.next_up()
-                } else {
-                    s
-                };
-                let d = if (exact as i64) as f64 > exact && v != 0 && signed && v as i64 > 0 {
-                    exact
-                } else {
-                    s as f64
-                };
-                let _ = d;
-                // f64 目标：i64→f64 RTZ
-                let d = if !src32 && to64 {
-                    if v == 0 {
-                        exact
-                    } else if signed && (v as i64) < 0 {
-                        // 负数向零 = 向上
-                        if exact < (v as i64) as f64 {
-                            exact.next_up()
-                        } else {
-                            exact
-                        }
-                    } else if exact > v as f64 {
-                        exact.next_down()
-                    } else {
-                        exact
-                    }
-                } else {
-                    s as f64
-                };
-                (s, d)
-            } else {
-                (exact as f32, exact)
+        let shift = bits - mant;
+        let half = 1u64 << (shift - 1);
+        let low = mag & ((1u64 << shift) - 1);
+        let mut high = mag >> shift;
+        let inexact = low != 0;
+        match rm {
+            Rm::RTZ => {}
+            Rm::RNE => {
+                if low > half || (low == half && high & 1 == 1) {
+                    high += 1;
+                }
+            }
+            Rm::RDN => {
+                // 负数向下 = 绝对值向上
+                if neg && inexact {
+                    high += 1;
+                }
+            }
+            Rm::RUP => {
+                if !neg && inexact {
+                    high += 1;
+                }
+            }
+            Rm::RMM => {
+                if low >= half {
+                    high += 1; // 平局远离零
+                }
             }
         }
-        Rm::RDN => {
-            let s = if nx && exact > 0.0 { (exact as f32).next_down() } else { exact as f32 };
-            let d = if nx && exact > 0.0 { exact.next_down() } else { exact };
-            (s, d)
-        }
-        Rm::RUP => {
-            let s = if nx && exact < 0.0 { (exact as f32).next_up() } else { exact as f32 };
-            let d = if nx && exact < 0.0 { exact.next_up() } else { exact };
-            (s, d)
-        }
-        Rm::RMM => (exact as f32, exact),
+        // high ≤ 2^mant，乘 2 的幂精确（结果不超过目标格式范围：
+        // 2^64 < f32::MAX）
+        let scaled = (high as f64) * (2f64).powi(shift as i32);
+        (if neg { -scaled } else { scaled }, inexact)
     };
     if to64 {
-        (r64.to_bits(), nx as u32)
+        (result.to_bits(), nx as u32)
     } else {
-        (r32.to_bits() as u64, nx as u32)
+        ((result as f32).to_bits() as u64, nx as u32)
     }
 }
 
-/// 格式转换 S↔D（S→D 恒精确；D→S 按 rm 舍入）
+/// 格式转换 S↔D（S→D 恒精确；D→S 按 rm 舍入，邻居比较在 f64 中精确）
 pub fn cvt_f_to_f(a: u64, to64: bool, rm: Rm) -> (u64, Flags) {
     if to64 {
         (f64::from(f32::from_bits(a as u32)).to_bits(), 0)
     } else {
         let x = f64::from_bits(a);
-        let rne = x as f32;
-        let nx = (rne as f64) != x;
+        let r = x as f32; // RNE
+        let nx = (r as f64) != x;
+        if !nx {
+            return (r.to_bits() as u64, 0);
+        }
         let v = match rm {
-            Rm::RNE => rne,
-            _ => {
-                let mut r = rne;
-                if nx {
-                    match rm {
-                        Rm::RNE => {}
-                        Rm::RTZ => {
-                            if (r as f64) > x {
-                                r = r.next_down();
-                            } else if (r as f64) < x {
-                                r = r.next_up();
-                            }
-                        }
-                        Rm::RDN => {
-                            if (r as f64) > x {
-                                r = r.next_down();
-                            }
-                        }
-                        Rm::RUP => {
-                            if (r as f64) < x {
-                                r = r.next_up();
-                            }
-                        }
-                        Rm::RMM => unreachable!(),
-                    }
+            Rm::RNE => r,
+            Rm::RTZ => {
+                if (r as f64) > x {
+                    // r 在精确值上方：向零 = 减小幅值（正数向下、负数即 r）
+                    if x > 0.0 { r.next_down() } else { r }
+                } else if x > 0.0 {
+                    r
+                } else {
+                    r.next_up()
                 }
-                r
+            }
+            Rm::RDN => {
+                if (r as f64) > x { r.next_down() } else { r }
+            }
+            Rm::RUP => {
+                if (r as f64) < x { r.next_up() } else { r }
+            }
+            Rm::RMM => {
+                let du = (r.next_up() as f64 - x).abs();
+                let dd = (x - r.next_down() as f64).abs();
+                if du < dd {
+                    r.next_up()
+                } else if dd < du {
+                    r.next_down()
+                } else if x > 0.0 {
+                    r.next_up() // 平局远离零
+                } else {
+                    r.next_down()
+                }
             }
         };
         let uf = nx && (v == 0.0 || v.is_subnormal());
