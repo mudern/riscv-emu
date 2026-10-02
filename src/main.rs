@@ -122,7 +122,7 @@ fn main() -> ExitCode {
             Ok(d) => d,
             Err(c) => return c,
         };
-        return boot_firmware(trace, stats, mem_mb, fw, kernel_data, flat_bin, dtb_data);
+        return boot_firmware(trace, stats, mem_mb, fw, kernel_data, dtb_data);
     }
     if kernel.is_some() || dtb.is_some() {
         eprintln!("--kernel/--dtb 需要 --bios");
@@ -174,7 +174,6 @@ fn boot_firmware(
     mem_mb: usize,
     fw: Vec<u8>,
     kernel: Option<Vec<u8>>,
-    kernel_flat: bool,
     dtb: Vec<u8>,
 ) -> ExitCode {
     let mut machine = Machine::new(mem_mb);
@@ -200,20 +199,21 @@ fn boot_firmware(
 
     let mut kernel_entry = 0;
     if let Some(data) = &kernel {
-        if kernel_flat {
-            // QEMU 对裸 Image 的默认加载地址
-            kernel_entry = riscv_emu::bus::DRAM_BASE + 0x20_0000;
-            if !machine.bus.write_dram(kernel_entry, data) {
-                eprintln!("内核大于 RAM");
-                return ExitCode::FAILURE;
-            }
-        } else {
+        // QEMU 同款：ELF 按其段地址加载，非 ELF（Image 裸二进制）放到
+        // DRAM_BASE + 0x200000（QEMU 的 kernel_start_addr 对齐规则）
+        if data.len() >= 4 && data[..4] == [0x7f, b'E', b'L', b'F'] {
             match elf::load_elf(data, &mut machine.bus) {
                 Ok(e) => kernel_entry = e,
                 Err(e) => {
                     eprintln!("加载内核 ELF 失败: {e}");
                     return ExitCode::FAILURE;
                 }
+            }
+        } else {
+            kernel_entry = riscv_emu::bus::DRAM_BASE + 0x20_0000;
+            if !machine.bus.write_dram(kernel_entry, data) {
+                eprintln!("内核大于 RAM");
+                return ExitCode::FAILURE;
             }
         }
     }
@@ -244,8 +244,36 @@ fn align_down(v: u64, a: u64) -> u64 {
 }
 
 fn run_and_report(mut machine: Machine, stats: bool) -> ExitCode {
+    // 后台线程阻塞读 stdin，每次读 1 字节送进通道；主循环按块运行模拟器，
+    // 块间把收到的字节注入 UART RX（busybox shell 的交互输入）。
+    let (tx, rx) = std::sync::mpsc::sync_channel::<u8>(0);
+    std::thread::spawn(move || {
+        use std::io::Read;
+        // 绕开 Stdin 的 BufReader（1 字节读会被 8KB 缓冲填满阻塞），
+        // 用 /dev/stdin 的无缓冲 fd 逐字节读
+        let Ok(mut stdin) = std::fs::File::open("/dev/stdin") else {
+            return;
+        };
+        let mut buf = [0u8; 1];
+        while let Ok(n) = stdin.read(&mut buf) {
+            if n == 0 || tx.send(buf[0]).is_err() {
+                return; // EOF 或宿主已退出
+            }
+        }
+    });
+
     let start = std::time::Instant::now();
-    let halt = machine.run(u64::MAX);
+    let halt = loop {
+        let halt = machine.run(200_000);
+        match halt {
+            Halt::Timeout => {}
+            other => break other,
+        }
+        // 块间排空输入通道（非阻塞）
+        while let Ok(byte) = rx.try_recv() {
+            machine.bus.uart.receive(byte);
+        }
+    };
     let elapsed = start.elapsed();
     if stats {
         let mips = machine.cpu.instret as f64 / elapsed.as_secs_f64() / 1e6;

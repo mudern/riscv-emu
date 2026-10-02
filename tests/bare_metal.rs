@@ -240,3 +240,56 @@ fn test_device_poweroff() {
     m.cpu.pc = DRAM_BASE;
     assert_eq!(m.run(1000), Halt::Exit(0));
 }
+
+/// amo/lr 32 位结果符号扩展到 64 位（内核引用计数依赖此语义；
+/// 曾因零扩展导致 Linux 的 i_writecount 泄漏、exec 报 ETXTBSY）
+#[test]
+fn amo_w_results_sign_extend() {
+    // amoswap.w a0, x0, (a1)：读回内存 0xFFFFFF80 → a0 = -128（符号扩展）
+    let mut a = Asm::default();
+    a.emit32(addi(11, 0, 1));
+    a.emit32(slli(11, 11, 31)); // a1 = 0x80000000（避免 lui 的 32 位符号扩展）
+    a.emit32(addi(11, 11, 0x7F0)); // +2032
+    a.emit32(addi(11, 11, 0x10)); // +16 → a1 = 0x80000800
+    a.emit32(addi(10, 0, -128)); // 数据 = 0xFFFFFFFFFFFFFF80
+    a.emit32(sd(10, 11, 0)); // [0x800] = 0xFFFFFFFFFFFFFF80
+    a.emit32(amoswap_w(10, 0, 11)); // a0 = [0x800] 低 32 位（swap 写入 x0=0）
+    a.emit32(addi(17, 0, 93));
+    a.emit32(i_type(0, 0, 0, 0, 0x73)); // ecall
+
+    let mut m = Machine::new(1);
+    assert!(m.bus.write_dram(DRAM_BASE, &a.buf));
+    m.cpu.pc = DRAM_BASE;
+    assert_eq!(m.run(1000), Halt::Exit(-128), "exit 码即 a0（旧值，符号扩展后）");
+    assert_eq!(m.cpu.regs[10], (-128i64) as u64, "amoswap.w 结果应符号扩展");
+
+    // lr.w 同理
+    let mut a = Asm::default();
+    a.emit32(addi(11, 0, 1));
+    a.emit32(slli(11, 11, 31));
+    a.emit32(addi(11, 11, 0x7F0));
+    a.emit32(addi(11, 11, 0x10));
+    a.emit32(addi(10, 0, -128));
+    a.emit32(sd(10, 11, 0));
+    a.emit32(lr_w(10, 11));
+    a.emit32(addi(17, 0, 93));
+    a.emit32(i_type(0, 0, 0, 0, 0x73));
+    let mut m = Machine::new(1);
+    assert!(m.bus.write_dram(DRAM_BASE, &a.buf));
+    m.cpu.pc = DRAM_BASE;
+    assert_eq!(m.run(1000), Halt::Exit(-128), "exit 码即 a0（旧值，符号扩展后）");
+    assert_eq!(m.cpu.regs[10], (-128i64) as u64, "lr.w 结果应符号扩展");
+}
+
+fn slli(rd: u32, rs1: u32, sh: u32) -> u32 {
+    i_type(sh as i32, rs1, 1, rd, 0x13)
+}
+
+/// amoswap.w rd, rs2, (rs1)：funct5=SWAP(0x01), funct3=W(2)
+fn amoswap_w(rd: u32, rs2: u32, rs1: u32) -> u32 {
+    (0x01 << 27) | (rs2 << 20) | (rs1 << 15) | (0x02 << 12) | (rd << 7) | 0x2F
+}
+/// lr.w rd, (rs1)：funct5=LR(0x02), rs2=0, funct3=W(2)
+fn lr_w(rd: u32, rs1: u32) -> u32 {
+    (0x02 << 27) | (rs1 << 15) | (0x02 << 12) | (rd << 7) | 0x2F
+}

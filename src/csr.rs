@@ -9,6 +9,9 @@ use crate::pmp::{PMP_COUNT, Pmp};
 /// CSR 地址
 #[allow(clippy::module_inception)]
 pub mod csr {
+    pub const FFLAGS: u16 = 0x001;
+    pub const FRM: u16 = 0x002;
+    pub const FCSR: u16 = 0x003;
     pub const SSTATUS: u16 = 0x100;
     pub const SIE: u16 = 0x104;
     pub const STVEC: u16 = 0x105;
@@ -55,6 +58,7 @@ pub const SPIE: u64 = 1 << 5;
 pub const MPIE: u64 = 1 << 7;
 pub const SPP: u64 = 1 << 8;
 pub const MPP: u64 = 3 << 11; // 掩码
+pub const FS: u64 = 3 << 13; // 掩码：Off/Initial/Clean/Dirty
 pub const MPRV: u64 = 1 << 17;
 pub const SUM: u64 = 1 << 18;
 pub const MXR: u64 = 1 << 19;
@@ -72,8 +76,8 @@ pub const MEIP: u64 = 1 << 11;
 pub const MIE_MASK: u64 = SSIP | MSIP | STIP | MTIP | SEIP | MEIP; // 0xAAA
 
 const MSTATUS_WRITE_MASK: u64 =
-    SIE | MIE | SPIE | MPIE | SPP | MPP | MPRV | SUM | MXR | TVM | TW | TSR;
-const SSTATUS_MASK: u64 = SIE | SPIE | SPP | SUM | MXR;
+    SIE | MIE | SPIE | MPIE | SPP | MPP | FS | MPRV | SUM | MXR | TVM | TW | TSR;
+const SSTATUS_MASK: u64 = SIE | SPIE | SPP | FS | SUM | MXR;
 
 /// 性能计数器快照（CSR 读取用）
 pub struct Counters {
@@ -106,6 +110,8 @@ pub struct Csrs {
     pub scounteren: u64,
     /// 存储 CSR：OpenSBI 用读探测决定特权级版本，值本身不参与计数
     pub mcountinhibit: u64,
+    /// fcsr：fflags（低 5 位）| frm（位 5-7）
+    pub fcsr: u32,
     pub menvcfg: u64,
     pub senvcfg: u64,
     /// PMP 规则（pmpcfg/pmpaddr CSR 的后端）
@@ -125,6 +131,8 @@ impl Csrs {
             misa: (2 << 62)
                 | (1 << 0) // I
                 | (1 << 2) // M
+                | (1 << 3) // D
+                | (1 << 5) // F
                 | (1 << 8) // A
                 | (1 << 12) // C
                 | (1 << 18) // S
@@ -148,6 +156,7 @@ impl Csrs {
             mcounteren: 0,
             scounteren: 0,
             mcountinhibit: 0,
+            fcsr: 0,
             menvcfg: 0,
             senvcfg: 0,
             pmp: Pmp::default(),
@@ -175,6 +184,17 @@ impl Csrs {
         }
         if is_pmp_csr(addr) {
             return self.pmp_read(addr);
+        }
+        if matches!(addr, csr::FFLAGS | csr::FRM | csr::FCSR) {
+            // mstatus.FS=Off 时访问浮点 CSR → illegal
+            if (self.mstatus >> 13) & 3 == 0 {
+                return None;
+            }
+            return Some(match addr {
+                csr::FFLAGS => (self.fcsr & 0x1F) as u64,
+                csr::FRM => ((self.fcsr >> 5) & 7) as u64,
+                _ => (self.fcsr & 0xFF) as u64,
+            });
         }
         Some(match addr {
             csr::MSTATUS => self.mstatus | (2 << 32) | (2 << 34), // SXL/UXL = 64 位
@@ -243,6 +263,17 @@ impl Csrs {
         }
         if is_pmp_csr(addr) {
             return self.pmp_write(addr, val);
+        }
+        if matches!(addr, csr::FFLAGS | csr::FRM | csr::FCSR) {
+            if (self.mstatus >> 13) & 3 == 0 {
+                return false;
+            }
+            match addr {
+                csr::FFLAGS => self.fcsr = (self.fcsr & !0x1F) | (val as u32 & 0x1F),
+                csr::FRM => self.fcsr = (self.fcsr & !(0x7 << 5)) | ((val as u32 & 0x7) << 5),
+                _ => self.fcsr = (self.fcsr & !0xFF) | (val as u32 & 0xFF),
+            }
+            return true;
         }
         match addr {
             csr::MSTATUS => {

@@ -108,6 +108,122 @@ pub enum CsrKind {
     Rc,
 }
 
+/// 浮点格式
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fmt {
+    S,
+    D,
+}
+
+impl Fmt {
+    fn from_f3(funct3: u32) -> Result<Fmt, Exception> {
+        match funct3 {
+            0 => Ok(Fmt::S),
+            1 => Ok(Fmt::D),
+            _ => Err(Exception::IllegalInstruction),
+        }
+    }
+}
+
+/// R4 型（乘加）选择
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FMulAdd {
+    Add,
+    Sub,
+    NAdd,
+    NAddNeg, // fnmadd：-(a*b+c)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FOp {
+    /// FADD/FSUB/FMUL/FDIV/FSQRT（Sqrt 时 rs2=0）
+    Arith {
+        op: crate::fpu::FArith,
+        fmt: Fmt,
+        rd: u8,
+        rs1: u8,
+        rs2: u8,
+        rm: u64,
+    },
+    /// 乘加：rd = ±(rs1*rs2 ± rs3)（单舍入）
+    MulAdd {
+        kind: FMulAdd,
+        fmt: Fmt,
+        rd: u8,
+        rs1: u8,
+        rs2: u8,
+        rs3: u8,
+        rm: u64,
+    },
+    /// 符号注入：neg = 取反、xor = 异或（FSGNJ/FSGNJN/FSGNJX）
+    Sgnj {
+        neg: bool,
+        xor: bool,
+        fmt: Fmt,
+        rd: u8,
+        rs1: u8,
+        rs2: u8,
+    },
+    /// FMIN/FMAX
+    MinMax {
+        max: bool,
+        fmt: Fmt,
+        rd: u8,
+        rs1: u8,
+        rs2: u8,
+    },
+    /// 比较：0=FLE 1=FLT 2=FEQ（结果写整数 rd）
+    Cmp {
+        kind: u8,
+        fmt: Fmt,
+        rd: u8,
+        rs1: u8,
+        rs2: u8,
+    },
+    /// 浮点 → 整数（signed/W-L）
+    Cvtf2i {
+        signed: bool,
+        is32: bool,
+        fmt: Fmt,
+        rd: u8,
+        rs1: u8,
+        rm: u64,
+    },
+    /// 整数 → 浮点
+    Cvti2f {
+        signed: bool,
+        src32: bool,
+        fmt: Fmt,
+        rd: u8,
+        rs1: u8,
+        rm: u64,
+    },
+    /// 格式转换（S↔D）
+    Cvtf2f {
+        to64: bool,
+        rd: u8,
+        rs1: u8,
+        rm: u64,
+    },
+    /// fmv.x.w / fmv.x.d（浮点位型直拷到整数）
+    FmvXf {
+        fmt: Fmt,
+        rd: u8,
+        rs1: u8,
+    },
+    /// fmv.w.x / fmv.d.x
+    FmvFx {
+        fmt: Fmt,
+        rd: u8,
+        rs1: u8,
+    },
+    Fclass {
+        fmt: Fmt,
+        rd: u8,
+        rs1: u8,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystemOp {
     Ecall,
@@ -183,6 +299,21 @@ pub enum Inst {
         rs1: u8,
         rs2: u8,
     },
+    /// 浮点加载 FLW/FLD（rd 为浮点寄存器）
+    FLoad {
+        fmt: Fmt,
+        rd: u8,
+        rs1: u8,
+        imm: i64,
+    },
+    /// 浮点存储 FSW/FSD（rs2 为浮点寄存器）
+    FStore {
+        fmt: Fmt,
+        rs1: u8,
+        rs2: u8,
+        imm: i64,
+    },
+    Fp(FOp),
     System(SystemOp),
     Fence,
     FenceI,
@@ -405,6 +536,187 @@ pub fn decode(w: u32) -> Result<Inst, Exception> {
             };
             Ok(Inst::Amo { op, w: is_w, rd, rs1, rs2 })
         }
+        0x07 => {
+            // LOAD-FP：FLW(2) / FLD(3)
+            let fmt = match funct3 {
+                2 => Fmt::S,
+                3 => Fmt::D,
+                _ => return Err(Exception::IllegalInstruction),
+            };
+            Ok(Inst::FLoad {
+                fmt,
+                rd,
+                rs1,
+                imm: i_imm(w),
+            })
+        }
+        0x27 => {
+            // STORE-FP：FSW(2) / FSD(3)
+            let fmt = match funct3 {
+                2 => Fmt::S,
+                3 => Fmt::D,
+                _ => return Err(Exception::IllegalInstruction),
+            };
+            Ok(Inst::FStore {
+                fmt,
+                rs1,
+                rs2,
+                imm: s_imm(w),
+            })
+        }
+        0x43 | 0x47 | 0x4B | 0x4F => {
+            // FMADD/FMSUB/FNMSUB/FNMADD（R4 型）
+            let fmt = Fmt::from_f3(funct3)?;
+            let kind = match opcode {
+                0x43 => FMulAdd::Add,
+                0x47 => FMulAdd::Sub,
+                0x4B => FMulAdd::NAdd,
+                _ => FMulAdd::NAddNeg,
+            };
+            let rs3 = ((w >> 27) & 0x1F) as u8;
+            Ok(Inst::Fp(FOp::MulAdd {
+                kind,
+                fmt,
+                rd,
+                rs1,
+                rs2,
+                rs3,
+                rm: (funct7 & 7) as u64,
+            }))
+        }
+        0x53 => {
+            // OP-FP：fmt 在 funct7 位 0（S=0/D=1），位 1 为 Q/H（未实现）
+            let fmt = if funct7 & 1 == 0 { Fmt::S } else { Fmt::D };
+            if funct7 & 2 != 0 {
+                return Err(Exception::IllegalInstruction);
+            }
+            let rm = funct3 as u64;
+            let op = match funct7 >> 2 {
+                0x00 => FOp::Arith {
+                    op: crate::fpu::FArith::Add,
+                    fmt,
+                    rd,
+                    rs1,
+                    rs2,
+                    rm,
+                },
+                0x01 => FOp::Arith {
+                    op: crate::fpu::FArith::Sub,
+                    fmt,
+                    rd,
+                    rs1,
+                    rs2,
+                    rm,
+                },
+                0x02 => FOp::Arith {
+                    op: crate::fpu::FArith::Mul,
+                    fmt,
+                    rd,
+                    rs1,
+                    rs2,
+                    rm,
+                },
+                0x03 => FOp::Arith {
+                    op: crate::fpu::FArith::Div,
+                    fmt,
+                    rd,
+                    rs1,
+                    rs2,
+                    rm,
+                },
+                0x16 => {
+                    if rs2 != 0 {
+                        return Err(Exception::IllegalInstruction);
+                    }
+                    FOp::Arith {
+                        op: crate::fpu::FArith::Sqrt,
+                        fmt,
+                        rd,
+                        rs1,
+                        rs2: 0,
+                        rm,
+                    }
+                }
+                0x04 => {
+                    let (neg, xor) = match funct3 {
+                        0 => (false, false),
+                        1 => (true, false),
+                        2 => (false, true),
+                        _ => return Err(Exception::IllegalInstruction),
+                    };
+                    FOp::Sgnj { neg, xor, fmt, rd, rs1, rs2 }
+                }
+                0x05 => {
+                    if funct3 > 1 {
+                        return Err(Exception::IllegalInstruction);
+                    }
+                    FOp::MinMax {
+                        max: funct3 == 1,
+                        fmt,
+                        rd,
+                        rs1,
+                        rs2,
+                    }
+                }
+                0x28 => {
+                    if funct3 > 2 {
+                        return Err(Exception::IllegalInstruction);
+                    }
+                    FOp::Cmp {
+                        kind: funct3 as u8,
+                        fmt,
+                        rd,
+                        rs1,
+                        rs2,
+                    }
+                }
+                0x08 => {
+                    // FCVT.S.D（fmt=S, rs2=1）/ FCVT.D.S（fmt=D, rs2=0）
+                    let to64 = match (fmt, rs2) {
+                        (Fmt::S, 1) => false,
+                        (Fmt::D, 0) => true,
+                        _ => return Err(Exception::IllegalInstruction),
+                    };
+                    FOp::Cvtf2f { to64, rd, rs1, rm }
+                }
+                0x10 => FOp::Cvtf2i {
+                    signed: rs2 == 0 || rs2 == 2,
+                    is32: rs2 == 0 || rs2 == 1,
+                    fmt,
+                    rd,
+                    rs1,
+                    rm,
+                },
+                0x1A => FOp::Cvti2f {
+                    signed: rs2 == 0 || rs2 == 2,
+                    src32: rs2 == 0 || rs2 == 1,
+                    fmt,
+                    rd,
+                    rs1,
+                    rm,
+                },
+                0x1C => {
+                    if rs2 != 0 {
+                        return Err(Exception::IllegalInstruction);
+                    }
+                    if funct3 == 0 {
+                        FOp::FmvXf { fmt, rd, rs1 }
+                    } else if funct3 == 1 {
+                        FOp::Fclass { fmt, rd, rs1 }
+                    } else {
+                        return Err(Exception::IllegalInstruction);
+                    }
+                }
+                0x1E => {
+                    if rs2 != 0 || funct3 != 0 {
+                        return Err(Exception::IllegalInstruction);
+                    }
+                    FOp::FmvFx { fmt, rd, rs1 }
+                }
+                _ => return Err(Exception::IllegalInstruction),
+            };
+            Ok(Inst::Fp(op))
+        }
         0x73 => {
             // SYSTEM
             if funct3 == 0 {
@@ -537,7 +849,26 @@ pub fn decode_compressed(h: u16) -> Result<Inst, Exception> {
                     imm: imm as i64,
                 })
             }
-            // 1/5 是 FP 加载，4 保留
+            1 => {
+                // C.FLD（CL 格式同 C.LD）
+                let imm = (((h >> 10) & 7) << 3) | (((h >> 5) & 3) << 6);
+                Ok(Inst::FLoad {
+                    fmt: Fmt::D,
+                    rd: 8 + ((h >> 2) & 7) as u8,
+                    rs1: 8 + ((h >> 7) & 7) as u8,
+                    imm: imm as i64,
+                })
+            }
+            5 => {
+                // C.FSD（CS 格式同 C.SD）
+                let imm = (((h >> 10) & 7) << 3) | (((h >> 5) & 3) << 6);
+                Ok(Inst::FStore {
+                    fmt: Fmt::D,
+                    rs1: 8 + ((h >> 7) & 7) as u8,
+                    rs2: 8 + ((h >> 2) & 7) as u8,
+                    imm: imm as i64,
+                })
+            }
             _ => Err(Exception::IllegalInstruction),
         },
         1 => {
@@ -652,7 +983,18 @@ pub fn decode_compressed(h: u16) -> Result<Inst, Exception> {
                     rs1: rd,
                     imm: ((((h >> 12) & 1) << 5) | ((h >> 2) & 0x1F)) as i64,
                 }), // C.SLLI
-                1 => Err(Exception::IllegalInstruction), // C.FLDSP（RV64），FP 未实现
+                1 => {
+                    // C.FLDSP
+                    let imm = (((h >> 2) & 7) << 6)
+                        | (((h >> 5) & 3) << 3)
+                        | (((h >> 12) & 1) << 5);
+                    Ok(Inst::FLoad {
+                        fmt: Fmt::D,
+                        rd,
+                        rs1: 2,
+                        imm: imm as i64,
+                    })
+                }
                 2 if rd != 0 => {
                     // C.LWSP
                     let imm = (((h >> 2) & 3) << 6)
@@ -711,7 +1053,16 @@ pub fn decode_compressed(h: u16) -> Result<Inst, Exception> {
                         }
                     }
                 }
-                5 => Err(Exception::IllegalInstruction), // C.FSWSP（RV64），FP 未实现
+                5 => {
+                    // C.FSDSP
+                    let imm = (((h >> 7) & 7) << 6) | (((h >> 10) & 7) << 3);
+                    Ok(Inst::FStore {
+                        fmt: Fmt::D,
+                        rs1: 2,
+                        rs2: ((h >> 2) & 0x1F) as u8,
+                        imm: imm as i64,
+                    })
+                }
                 6 => {
                     // C.SWSP（CSS：uimm[5:2]=inst[12:9], uimm[7:6]=inst[8:7], rs2=inst[6:2]）
                     let imm = (((h >> 9) & 0xF) << 2) | (((h >> 7) & 3) << 6);
@@ -732,7 +1083,6 @@ pub fn decode_compressed(h: u16) -> Result<Inst, Exception> {
                         imm: imm as i64,
                     })
                 }
-                // 1/5 是 FP
                 _ => Err(Exception::IllegalInstruction),
             }
         }

@@ -134,7 +134,13 @@ impl Uart {
                 if self.dlab() {
                     self.dlm = val;
                 } else {
+                    let old = self.ier;
                     self.ier = val & 0x0F;
+                    // IER.1 使能沿：THR 恒空，真硬件此时立即挂起 THRE 中断
+                    //（驱动 stop_tx/start_tx 循环依赖这一语义，否则丢唤醒）
+                    if val & 0x02 != 0 && old & 0x02 == 0 {
+                        self.thre_ip = true;
+                    }
                 }
             }
             2 => {

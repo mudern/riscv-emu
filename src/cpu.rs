@@ -8,7 +8,7 @@ use std::io::{self, Write};
 use crate::bus::Bus;
 use crate::csr::{self, Counters, Csrs};
 use crate::decode::{
-    AluOp, AmoOp, BranchOp, CsrKind, Inst, LoadOp, SystemOp, decode, decode_compressed,
+    AluOp, AmoOp, BranchOp, CsrKind, Fmt, Inst, LoadOp, SystemOp, decode, decode_compressed,
 };
 use crate::exception::{Exception, TrapInfo};
 use crate::mmu::{self, Access, Mmu};
@@ -56,6 +56,8 @@ pub struct Cpu {
     /// 外部中断控制器持有的中断线（PLIC）：MEIP/SEIP 位，运行循环每步刷新。
     /// 与 mip 中软件可写的 SEIP 位合并后才是有效视图。
     pub ext_mip: u64,
+    /// 浮点寄存器 f0-f31（f32 以 NaN-boxing 形式存放于高 32 位）
+    pub fregs: [u64; 32],
 }
 
 type ExecResult = Result<(), (Exception, u64)>;
@@ -74,6 +76,7 @@ impl Cpu {
             trace: false,
             sbi: false,
             ext_mip: 0,
+            fregs: [0; 32],
         }
     }
 
@@ -84,6 +87,43 @@ impl Cpu {
     fn set_reg(&mut self, idx: u8, val: u64) {
         if idx != 0 {
             self.regs[idx as usize] = val;
+        }
+    }
+
+    /// mstatus.FS != Off（浮点可用）
+    fn fs_enabled(&self) -> bool {
+        (self.csr.mstatus >> 13) & 3 != 0
+    }
+
+    /// 浮点指令执行后置 FS=Dirty
+    fn fs_mark_dirty(&mut self) {
+        self.csr.mstatus |= 3 << 13;
+    }
+
+    fn freg32(&self, i: u8) -> u32 {
+        let v = self.fregs[i as usize];
+        if v >> 32 == 0xFFFF_FFFF {
+            v as u32
+        } else {
+            (crate::fpu::CANON_F32) as u32
+        }
+    }
+    fn set_freg32(&mut self, i: u8, v: u32) {
+        self.fregs[i as usize] = 0xFFFF_FFFF_0000_0000 | v as u64;
+    }
+    fn set_freg64(&mut self, i: u8, v: u64) {
+        self.fregs[i as usize] = v;
+    }
+    fn freg(&self, i: u8, fmt: Fmt) -> u64 {
+        match fmt {
+            Fmt::S => self.freg32(i) as u64,
+            Fmt::D => self.fregs[i as usize],
+        }
+    }
+    fn set_freg(&mut self, i: u8, fmt: Fmt, v: u64) {
+        match fmt {
+            Fmt::S => self.set_freg32(i, v as u32),
+            Fmt::D => self.fregs[i as usize] = v,
         }
     }
 
@@ -333,6 +373,41 @@ impl Cpu {
                 let (a, b) = (self.reg(rs1), self.reg(rs2));
                 self.set_reg(rd, alu(op, a, b));
             }
+            Inst::FLoad { fmt, rd, rs1, imm } => {
+                if !self.fs_enabled() {
+                    return Err((Exception::IllegalInstruction, raw as u64));
+                }
+                let vaddr = self.reg(rs1).wrapping_add(imm as u64);
+                let size = match fmt {
+                    Fmt::S => 4,
+                    Fmt::D => 8,
+                };
+                let val = self.guest_load(bus, vaddr, size)?;
+                match fmt {
+                    Fmt::S => self.set_freg32(rd, val as u32),
+                    Fmt::D => self.set_freg64(rd, val),
+                }
+                self.fs_mark_dirty();
+            }
+            Inst::FStore { fmt, rs1, rs2, imm } => {
+                if !self.fs_enabled() {
+                    return Err((Exception::IllegalInstruction, raw as u64));
+                }
+                let vaddr = self.reg(rs1).wrapping_add(imm as u64);
+                let size = match fmt {
+                    Fmt::S => 4,
+                    Fmt::D => 8,
+                };
+                let val = match fmt {
+                    Fmt::S => self.freg32(rs2) as u64,
+                    Fmt::D => self.fregs[rs2 as usize],
+                };
+                self.guest_store(bus, vaddr, size, val)?;
+                self.fs_mark_dirty();
+            }
+            Inst::Fp(op) => {
+                self.exec_fp(op)?;
+            }
             Inst::Amo {
                 op,
                 w,
@@ -373,7 +448,11 @@ impl Cpu {
                 let mask: u64 = if w { 0xFFFF_FFFF } else { u64::MAX };
                 match op {
                     AmoOp::Lr => {
-                        let v = bus.load(addr, size).map_err(|e| (e, vaddr))?;
+                        let mut v = bus.load(addr, size).map_err(|e| (e, vaddr))?;
+                        // 规范：32 位 AMO/LR 结果符号扩展到 64 位
+                        if w {
+                            v = (v as u32 as i32) as i64 as u64;
+                        }
                         self.reservation = Some(vaddr);
                         self.set_reg(rd, v);
                     }
@@ -388,7 +467,10 @@ impl Cpu {
                         }
                     }
                     _ => {
-                        let old = bus.load(addr, size).map_err(|e| (e, vaddr))? & mask;
+                        let mut old = bus.load(addr, size).map_err(|e| (e, vaddr))? & mask;
+                        if w {
+                            old = (old as u32 as i32) as i64 as u64;
+                        }
                         let b = self.reg(rs2) & mask;
                         let new = match op {
                             AmoOp::Swap => b,
@@ -515,6 +597,153 @@ impl Cpu {
             }
         }
         Ok(false)
+    }
+
+    /// 浮点指令执行（mstatus.FS=Off 时 illegal）
+    fn exec_fp(&mut self, op: crate::decode::FOp) -> ExecResult {
+        use crate::decode::Fmt as F;
+        use crate::fpu;
+        if !self.fs_enabled() {
+            return Err((Exception::IllegalInstruction, 0));
+        }
+        // 统一出口：写 f 寄存器/fflags 后置 FS=Dirty
+        macro_rules! finish {
+            () => {
+                self.fs_mark_dirty();
+                return Ok(());
+            };
+        }
+        match op {
+            crate::decode::FOp::Arith { op, fmt, rd, rs1, rs2, rm } => {
+                let mode = fpu::effective_rm(rm, self.csr.fcsr).ok_or((Exception::IllegalInstruction, 0))?;
+                let (val, flags) = match fmt {
+                    F::S => {
+                        let (v, f) = fpu::arith32(op, self.freg32(rs1), self.freg32(rs2), mode);
+                        self.set_freg32(rd, v);
+                        (v as u64, f)
+                    }
+                    F::D => {
+                        let (v, f) = fpu::arith64(op, self.fregs[rs1 as usize], self.fregs[rs2 as usize], mode);
+                        self.set_freg64(rd, v);
+                        (v, f)
+                    }
+                };
+                self.csr.fcsr |= flags;
+                let _ = val;
+                finish!();
+            }
+            crate::decode::FOp::MulAdd { kind, fmt, rd, rs1, rs2, rs3, rm } => {
+                let mode = fpu::effective_rm(rm, self.csr.fcsr).ok_or((Exception::IllegalInstruction, 0))?;
+                let (val, flags) = match fmt {
+                    F::S => fpu::muladd32(kind, self.freg32(rs1), self.freg32(rs2), self.freg32(rs3), mode),
+                    F::D => fpu::muladd64(kind, self.fregs[rs1 as usize], self.fregs[rs2 as usize], self.fregs[rs3 as usize], mode),
+                };
+                self.set_freg(rd, fmt, val);
+                self.csr.fcsr |= flags;
+                finish!();
+            }
+            crate::decode::FOp::Sgnj { neg, xor, fmt, rd, rs1, rs2 } => {
+                let (a, b) = (self.freg(rs1, fmt), self.freg(rs2, fmt));
+                let bits = match fmt {
+                    F::S => 32,
+                    F::D => 64,
+                };
+                let sign: u64 = 1 << (bits - 1);
+                let mask: u64 = sign - 1;
+                let sign_bit = if xor {
+                    (a ^ b) & sign
+                } else if neg {
+                    (b ^ sign) & sign
+                } else {
+                    b & sign
+                };
+                let val = (a & mask) | sign_bit;
+                self.set_freg(rd, fmt, val);
+                finish!();
+            }
+            crate::decode::FOp::MinMax { max, fmt, rd, rs1, rs2 } => {
+                let val: u64 = match fmt {
+                    F::S => {
+                        let v = if max {
+                            fpu::fmax32(self.freg32(rs1), self.freg32(rs2))
+                        } else {
+                            fpu::fmin32(self.freg32(rs1), self.freg32(rs2))
+                        };
+                        v as u64
+                    }
+                    F::D => {
+                        if max {
+                            fpu::fmax64(self.fregs[rs1 as usize], self.fregs[rs2 as usize])
+                        } else {
+                            fpu::fmin64(self.fregs[rs1 as usize], self.fregs[rs2 as usize])
+                        }
+                    }
+                };
+                self.set_freg(rd, fmt, val);
+                finish!();
+            }
+            crate::decode::FOp::Cmp { kind, fmt, rd, rs1, rs2 } => {
+                let (r, flags) = match fmt {
+                    F::S => fpu::fcmp32(kind, self.freg32(rs1), self.freg32(rs2)),
+                    F::D => fpu::fcmp64(kind, self.fregs[rs1 as usize], self.fregs[rs2 as usize]),
+                };
+                self.set_reg(rd, r as u64);
+                self.csr.fcsr |= flags;
+                finish!();
+            }
+            crate::decode::FOp::Cvtf2i { signed, is32, fmt, rd, rs1, rm } => {
+                let mode = fpu::effective_rm(rm, self.csr.fcsr).ok_or((Exception::IllegalInstruction, 0))?;
+                let exact = match fmt {
+                    F::S => f32::from_bits(self.freg32(rs1)) as f64,
+                    F::D => f64::from_bits(self.fregs[rs1 as usize]),
+                };
+                let (val, flags) = fpu::cvt_f_to_i(exact, mode, signed, is32);
+                self.set_reg(rd, val);
+                self.csr.fcsr |= flags;
+                finish!();
+            }
+            crate::decode::FOp::Cvti2f { signed, src32, fmt, rd, rs1, rm } => {
+                let mode = fpu::effective_rm(rm, self.csr.fcsr).ok_or((Exception::IllegalInstruction, 0))?;
+                let (val, flags) = fpu::cvt_i_to_f(self.reg(rs1), signed, src32, matches!(fmt, F::D), mode);
+                self.set_freg(rd, fmt, val);
+                self.csr.fcsr |= flags;
+                finish!();
+            }
+            crate::decode::FOp::Cvtf2f { to64, rd, rs1, rm } => {
+                let mode = fpu::effective_rm(rm, self.csr.fcsr).ok_or((Exception::IllegalInstruction, 0))?;
+                let (val, flags) = if to64 {
+                    fpu::cvt_f_to_f(self.freg32(rs1) as u64, true, mode)
+                } else {
+                    fpu::cvt_f_to_f(self.fregs[rs1 as usize], false, mode)
+                };
+                self.set_freg(rd, if to64 { F::D } else { F::S }, val);
+                self.csr.fcsr |= flags;
+                finish!();
+            }
+            crate::decode::FOp::FmvXf { fmt, rd, rs1 } => {
+                let val = match fmt {
+                    F::S => self.freg32(rs1) as i32 as i64 as u64,
+                    F::D => self.fregs[rs1 as usize],
+                };
+                self.set_reg(rd, val);
+                finish!();
+            }
+            crate::decode::FOp::FmvFx { fmt, rd, rs1 } => {
+                match fmt {
+                    F::S => self.set_freg32(rd, self.reg(rs1) as u32),
+                    F::D => self.set_freg64(rd, self.reg(rs1)),
+                }
+                finish!();
+            }
+            crate::decode::FOp::Fclass { fmt, rd, rs1 } => {
+                let val = match fmt {
+                    F::S => fpu::fclass32(self.freg32(rs1)),
+                    F::D => fpu::fclass64(self.fregs[rs1 as usize]),
+                };
+                self.set_reg(rd, val);
+                finish!();
+            }
+        }
     }
 
     /// 阶段 1 约定：M-mode ecall 作为宿主调用（Linux 风格 ABI）。

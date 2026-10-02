@@ -1,0 +1,11 @@
+#!/bin/busybox sh
+# PID 1：挂载基础 fs，装 busybox 符号链接，进交互 shell
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sysfs /sys
+/bin/busybox --install -s /bin
+/bin/setwinsize
+echo
+echo "riscv-emu: Linux 6.19-rc2 + busybox ready"
+/bin/busybox uname -a
+/bin/busybox cat /proc/cpuinfo
+exec /bin/busybox sh

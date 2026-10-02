@@ -10,6 +10,7 @@ pub mod decode;
 pub mod devices;
 pub mod elf;
 pub mod exception;
+pub mod fpu;
 pub mod machine;
 pub mod mmu;
 pub mod pmp;

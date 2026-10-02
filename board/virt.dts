@@ -1,7 +1,7 @@
 /dts-v1/;
 
 // 设备树：对齐 QEMU `virt` 机器（qemu-system-riscv64 -M virt），做如下裁剪：
-//   1. CPU 扩展：只保留本模拟器实现的 rv64imac（Zicsr/Zifencei 隐含），
+//   1. CPU 扩展：只保留本模拟器实现的 rv64imafdc（Zicsr/Zifencei 隐含），
 //      mmu-type 固定 Sv39 —— 用
 //      `qemu-system-riscv64 -M virt,dumpdtb -cpu rv64,f=off,d=off,v=off,h=off,
 //       zfa=off,zawrs=off,sstc=off,svadu=off,zicbom=off,zicbop=off,zicboz=off,
@@ -52,8 +52,8 @@
 			reg = <0x00>;
 			status = "okay";
 			compatible = "riscv";
-			riscv,isa-extensions = "i", "m", "a", "c", "zicntr", "zicsr", "zifencei";
-			riscv,isa = "rv64imac_zicntr_zicsr_zifencei";
+			riscv,isa-extensions = "i", "m", "a", "f", "d", "c", "zicntr", "zicsr", "zifencei";
+			riscv,isa = "rv64imafdc_zicntr_zicsr_zifencei";
 			mmu-type = "riscv,sv39";
 
 			interrupt-controller {
@@ -79,6 +79,7 @@
 
 	chosen {
 		stdout-path = "/soc/serial@10000000";
+		bootargs = "console=ttyS0";
 		// 固定熵种子：保证两次引导内核随机池状态一致，便于差分
 		rng-seed = <0x1e76c20 0xe1a3be35 0x3475553d 0x6e8dddf0 0x340ae3ad 0x2bf2e8c2 0xbeae471d 0x104bbeca>;
 	};

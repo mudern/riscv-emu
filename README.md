@@ -2,16 +2,20 @@
 
 用 Rust 写的 RISC-V 全系统模拟器。目标（长线）：启动 Linux 内核 + busybox。
 
-当前是**阶段 3**：真固件引导（OpenSBI fw_dynamic）+ PLIC + 16550 接收中断。
-`--bios fw_dynamic.bin --kernel payload.elf --dtb board/virt.dtb` 引导真 OpenSBI
-v1.5 进入 S 态 payload，与 `qemu-system-riscv64 -M virt`（QEMU 11.1.1，同一
-固件与 DTB，`-cpu` 关闭本模拟器未实现的扩展）输出与退出码**逐字节一致**。
-阶段 2 的特权级/Sv39/PMP/定时器与阶段 1 的裸机对照测试依旧全绿。
+当前是**阶段 3**：真固件引导 + F/D 浮点 + **启动 Linux + busybox shell**。
+`--bios fw_dynamic.bin --kernel Image --dtb board/virt.dtb` 引导真 OpenSBI v1.5
+→ Linux 6.19-rc2（LLVM 构建，CONFIG_FPU=y）→ 内嵌 initramfs 的 busybox
+ash 交互 shell，`poweroff -f` 干净关机（宿主退出码 0）。全流程约 12.7 亿条
+指令、95 秒（13.3 MIPS）。与 QEMU 11.1.1（同固件/DTB/内核，`-cpu` 关闭
+本模拟器未实现的扩展）对比：OpenSBI banner + payload 输出逐字节一致；
+内核 dmesg 98 行中仅性能自测值（raid6/xor/对齐访问比例）与能力差异
+（无 H 扩展的 ELF compat）不同，其余全部一致。
 
 ## 已支持
 
-- ISA：RV64IMAC + Zicsr + Zifencei（压缩指令解码为规范形式；F/D 暂未实现，
-  编译时用 `-march=rv64imac` 即可）
+- ISA：RV64IMAFDC + Zicsr + Zifencei（含完整 F/D 浮点：IEEE 语义、
+  全部 5 种舍入模式、fflags 精确标志——inexact/underflow 用无误差变换
+  （two-sum/FMA 残差）判定；NaN 规范化；f32 NaN-boxing）
 - 特权级：M/S/U 三级，标准 trap 交付（mtvec/stvec、vectored 模式）、
   medeleg/mideleg 委托、mret/sret、MPRV/SUM/MXR/TVM/TW/TSR
 - Sv39 MMU：三级走表、大页（对齐检查）、U/S 权限与 SUM/MXR、A/D 位自动置位、
@@ -32,8 +36,8 @@ v1.5 进入 S 态 payload，与 `qemu-system-riscv64 -M virt`（QEMU 11.1.1，�
   fw_dynamic.bin 即裸二进制装到 0x8000_0000）；FDT 按 QEMU 规则放 RAM 顶
   2MB 对齐处
 - CSR 面：mcounteren/scounteren（U/S 计数器访问权限）、mcountinhibit、
-  menvcfg/senvcfg 存储位；misa = RV64 IMA C S U（OpenSBI 用 CSR 读探测
-  特权级版本与扩展，本实现可探测到 priv 1.12）
+  menvcfg/senvcfg、fcsr/fflags/frm（受 mstatus.FS 门控）；mstatus.FS
+  Off/Initial/Clean/Dirty 跟踪；misa = RV64 IMA F D C S U
 - 内存布局对齐 QEMU `virt` 机器：
 
   | 区域 | 范围 | 说明 |
@@ -44,8 +48,11 @@ v1.5 进入 S 态 payload，与 `qemu-system-riscv64 -M virt`（QEMU 11.1.1，�
   | UART | `0x1000_0000` | NS16550，中断接 PLIC 源 10 |
   | RAM | `0x8000_0000` | 默认 128MB，`--mem` 可调 |
 
-- ELF64 加载器（静态、非 PIE、`ET_EXEC`；`ET_DYN` 按 p_vaddr 原地装入，
-  同 QEMU load_elf，兼容 OpenSBI 固件 ELF）
+- ELF64 加载器（静态、非 PIE；`ET_DYN` 按 p_vaddr 原地装入，同 QEMU
+  load_elf；内核 vmlinux 按 p_paddr 加载并换算物理入口，Image 裸二进制
+  放 0x8020_0000——均对齐 QEMU）
+- 交互控制台：宿主 stdin 逐字节注入 UART RX（绕开 stdio 缓冲），
+  busybox shell 可交互
 
 ### 阶段 1 约定（裸机程序怎么用）
 
@@ -152,14 +159,50 @@ QEMU `-cpu` 关闭扩展后 dumpdtb 再手工编辑），删除本模拟器未�
 时 MMIO load fault）。memory 节点固定 128MB，与默认 `--mem 128` 一致。
 修改后用 `dtc -I dts -O dtb -o board/virt.dtb board/virt.dts` 重编译。
 
+## 启动 Linux（阶段 3 成果）
+
+内核与 initramfs 的构建（宿主机 clang/LLVM 即可，无交叉工具链）：
+
+```sh
+# 内核：Linux 6.19-rc2，CONFIG_FPU=y（DTB isa=rv64imafdc）、SMP/EFI/NET 等关闭、
+# 内嵌 initramfs（initramfs/initramfs.list 清单：busybox 静态二进制 + /init）
+cd ~/Code/source/linux
+make O=build-rv64-emu ARCH=riscv LLVM=1 defconfig
+./scripts/config --file build-rv64-emu/.config -d SMP -d EFI -d NET -d PCI \
+  -e FPU -e BLK_DEV_INITRD --set-str INITRAMFS_SOURCE <repo>/initramfs/initramfs.list
+make O=build-rv64-emu ARCH=riscv LLVM=1 olddefconfig Image
+
+# busybox：Debian riscv64 静态包（硬浮点 ABI，需 F/D）
+curl -O https://mirrors.kernel.org/debian/pool/main/b/busybox/busybox-static_*_riscv64.deb
+ar x busybox-static_*.deb && tar xf data.tar.xz   # usr/bin/busybox
+```
+
+引导：
+
+```sh
+./target/x86_64-unknown-linux-musl/release/riscv-emu \
+    --bios "$FW" --kernel Image --dtb board/virt.dtb
+# OpenSBI banner → 内核 dmesg → /init（挂载 proc/sys、busybox --install、
+# 设置终端尺寸）→ "~ #" 交互 shell（stdin 已接入）
+```
+
+关键引导语义（都在内核/固件代码里可直接印证）：
+- **amoswap.w/lr.w 结果符号扩展**——内核引用计数（i_writecount 等）依赖；
+  曾因零扩展导致 exec 报 ETXTBSY
+- **THRE 中断在 IER.1 使能沿立即挂起**（THR 恒空）——驱动 stop_tx/start_tx
+  循环依赖，否则 tty 发送永久停摆
+- **mstatus.FS 在 bits 14:13**——OpenSBI/kernel 切换浮点上下文依赖
+- OpenSBI 把 CLINT 区 PMP 保护为 M-only，S 态读时间须用 `rdtime`
+
 ## 代码结构
 
 ```
 src/
-  main.rs        CLI：参数解析、固件引导流程、诊断信息
+  main.rs        CLI：参数解析、固件引导流程、stdin 接入、诊断信息
   machine.rs     整机：CPU + 总线，运行循环（中断线同步），停机原因
   cpu.rs         hart：执行、ALU 语义、特权级/trap 交付、地址翻译与 PMP
   csr.rs         CSR 文件：M/S 两级 CSR、位域视图、pmpcfg/pmpaddr 后端
+  fpu.rs         IEEE-754 F/D 核心（舍入/标志的无误差变换实现）
   decode.rs      RV64IMAC 指令解码（32 位 + 16 位压缩 → 规范形式）
   bus.rs         物理地址路由：RAM / MMIO
   mmu.rs         Sv39 走表 + 直接映射 TLB
@@ -169,6 +212,7 @@ src/
   devices/       uart（NS16550）、clint（msip/mtime/mtimecmp）、
                  plic（96 源 M/S 双 context）、testdev（sifive_test）
 board/           virt.dts/dtb（对齐 QEMU virt 的裁剪设备树）
+initramfs/       内嵌 initramfs：清单、/init、busybox 静态二进制、setwinsize
 tests/
   common/        最小指令编码器 + 裸机程序装配器
   bare_metal.rs  手工编码指令的集成测试（ALU/乘法/AMO/压缩指令/trap/ecall）
@@ -179,17 +223,18 @@ tests/
   plic.rs        PLIC：UART RX 中断 M/S 交付、claim/complete、阈值、pending
   sbi.rs         内置 SBI 冒烟测试
   opensbi.rs     真 OpenSBI 引导冒烟测试（设 OPENSBI_FW 后启用）
+  fpu.rs         F/D 数值语义单元测试（舍入/标志/NaN/转换）
+  fp_ctx.rs      FP 保存/恢复与内存完整性（内核 fstate 模式）
 ```
 
 ## 路线图（后续阶段）
 
 1. ~~特权级与 MMU~~、~~中断~~、~~SBI~~（阶段 2）
-2. ~~PLIC~~、~~16550 RX~~、~~OpenSBI fw_dynamic 引导~~（阶段 3 完成 OpenSBI
-   差分对齐）
-3. **引导 Linux 6.19-rc2 + busybox**（initramfs；Linux 需要 PLIC/CLINT/
-   UART/`--bios`，都已就位）
-4. **F/D 扩展**：浮点
-5. **virtio-blk / virtio-net**（磁盘、网络）
+2. ~~PLIC~~、~~16550 RX~~、~~OpenSBI fw_dynamic 引导~~、~~F/D 浮点~~、
+   ~~Linux 6.19-rc2 + busybox shell~~（阶段 3 完成 ✅）
+3. **virtio-blk**（磁盘 rootfs，替代 initramfs）/ virtio-net
+4. **性能**：指令解码缓存 / TLB 优化（当前 13 MIPS，目标 50+）
+5. 多核（SMP harts + MSWI/ACLINT）
 
 ## 测试
 

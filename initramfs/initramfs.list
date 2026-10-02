@@ -1,0 +1,9 @@
+dir /proc 0755 0 0
+dir /sys 0755 0 0
+dir /bin 0755 0 0
+dir /dev 0755 0 0
+nod /dev/console 0600 0 0 c 5 1
+file /init /home/mudern/Code/rust/riscv-emu/initramfs/init 0755 0 0
+file /bin/busybox /home/mudern/Code/rust/riscv-emu/initramfs/busybox 0755 0 0
+file /bin/setwinsize /home/mudern/Code/rust/riscv-emu/initramfs/setwinsize 0755 0 0
+slink /bin/sh /bin/busybox 0777 0 0
