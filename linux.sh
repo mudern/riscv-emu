@@ -11,13 +11,11 @@ EMU=target/x86_64-unknown-linux-musl/release/riscv-emu
 # 1. 固件 + 内核（缺失则克隆源码并编译）
 [ -f dist/fw_dynamic.bin ] && [ -f dist/Image ] || sh dist/build-all.sh
 
-# 2. busybox initramfs（用内核构建产出的 gen_init_cpio 生成）
+# 2. busybox initramfs（下载 busybox + gen_init_cpio 打包）
 if [ ! -f initramfs/busybox.cpio ]; then
     GEN=dist/src/linux/build-rv64-emu/usr/gen_init_cpio
     [ -x "$GEN" ] || GEN="$HOME/Code/source/linux/build-rv64-emu/usr/gen_init_cpio"
-    [ -x "$GEN" ] || { echo "需要 gen_init_cpio（先完成内核构建）"; exit 1; }
-    "$GEN" -o initramfs/busybox.cpio initramfs/initramfs.list
-    echo "✓ initramfs/busybox.cpio"
+    initramfs/build-busybox-initramfs.sh "$GEN"
 fi
 
 # 3. 启动

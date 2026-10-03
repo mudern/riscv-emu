@@ -8,3 +8,4 @@ board/alpine/dl/
 examples/*.elf
 examples/sbi_min.elf
 initramfs/busybox.cpio
+initramfs/busybox

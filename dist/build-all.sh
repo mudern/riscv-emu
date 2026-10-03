@@ -64,8 +64,5 @@ GEN="$SRC/linux/build-rv64-emu/usr/gen_init_cpio"
 if [ "$WANT_LINUX" = 1 ] && [ ! -x "$GEN" ]; then
     make -C "$SRC/linux" O=build-rv64-emu ARCH=riscv LLVM=1 usr/gen_init_cpio
 fi
-if [ -x "$GEN" ] && [ ! -f ../initramfs/busybox.cpio ]; then
-    "$GEN" -o ../initramfs/busybox.cpio ../initramfs/initramfs.list
-    echo "✓ initramfs/busybox.cpio"
-fi
+# busybox initramfs 由 linux.sh 按需生成（initramfs/build-busybox-initramfs.sh）
 echo "构建完成"

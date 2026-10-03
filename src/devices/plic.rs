@@ -96,10 +96,6 @@ impl Plic {
         self.best(ctx).is_some()
     }
 
-    pub fn dbg_enable(&self, ctx: usize) -> u32 { self.enable[ctx][0] }
-    pub fn dbg_pending(&self) -> u32 { self.pending[0] }
-    pub fn dbg_prio(&self, src: u32) -> u32 { self.priority[src as usize] }
-
     /// 认领（读 claim 寄存器）：清挂起、置网关占用，返回源号（无则 0）。
     pub fn claim(&mut self, ctx: usize) -> u32 {
         match self.best(ctx) {
