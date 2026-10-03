@@ -248,46 +248,53 @@ tests/
 
 ## 使用教程
 
+### 一键启动（推荐）
+
+```sh
+cargo build --release      # 编译模拟器
+./run.sh minios            # 裸机迷你 OS
+./run.sh torture           # 指令集压力测试
+./run.sh linux             # OpenSBI + Linux + busybox 交互 shell
+./run.sh alpine            # Alpine + musl + tcc：VM 内编译 hello world
+```
+
+产物（OpenSBI 固件 / Linux Image / rootfs.cpio）缺失时 `run.sh` 会自动
+调用 `dist/build-all.sh`（git clone + 编译，源码放 `dist/src/`，二进制
+输出到 `dist/`，均已 gitignore；`~/Code/source` 下已有同名源码则直接复用）。
+首次构建约 5-10 分钟（下载 260MB + 编译）。
+
+手动等价命令：
+
+```sh
+sh dist/build-all.sh                    # 拉源码构建固件 + 内核（可只传 opensbi|linux）
+board/alpine/build-rootfs.sh dist/rootfs.cpio   # 生成 Alpine initramfs
+
+./target/x86_64-unknown-linux-musl/release/riscv-emu \
+    --bios dist/fw_dynamic.bin --kernel dist/Image \
+    --initrd dist/rootfs.cpio --dtb board/virt.dtb --mem 512
+```
+
+### 源码级细节
+
 ### 1. 裸机程序（阶段 1/2，无需固件）
 
 ```sh
-cargo build --release
 ./target/x86_64-unknown-linux-musl/release/riscv-emu examples/minios.elf
 ./target/x86_64-unknown-linux-musl/release/riscv-emu --stats examples/torture.elf
 ```
 
 ### 2. OpenSBI + Linux + busybox shell
 
-前置（一次性）：
-- 内核 Image：见上文"启动 Linux"一节的构建命令（`build-rv64-emu/arch/riscv/boot/Image`）。
-  **注意**：内核不含内嵌 initramfs，必须配 `--initrd`
-- OpenSBI 固件：`fw_dynamic.bin`（构建命令见上文）
+内核不含内嵌 initramfs，必须配 `--initrd initramfs/busybox.cpio`
+（busybox.cpio 由 `gen_init_cpio initramfs/initramfs.list` 生成，
+`dist/build-all.sh` 会自动做；stdin 已接通，`poweroff -f` 退出）。
 
-```sh
-EMU=./target/x86_64-unknown-linux-musl/release/riscv-emu
-FW=~/Code/source/opensbi/build/platform/generic/firmware/fw_dynamic.bin
-KERNEL=~/Code/source/linux/build-rv64-emu/arch/riscv/boot/Image
+### 3. Alpine + musl + tcc
 
-$EMU --bios "$FW" --kernel "$KERNEL" --initrd initramfs/busybox.cpio --dtb board/virt.dtb
-# 引导至 busybox 交互 shell（stdin 已接通，可输入命令），
-# 退出：poweroff -f
-# busybox.cpio 可用 gen_init_cpio 重新生成：
-# ~/Code/source/linux/build-rv64-emu/usr/gen_init_cpio initramfs/initramfs.list > initramfs/busybox.cpio
-```
-
-### 3. Alpine + musl + tcc：在模拟器里编译程序
-
-```sh
-# 一次性：生成 Alpine rootfs initramfs（下载 ~8MB，无需 root）
-board/alpine/build-rootfs.sh /tmp/rootfs.cpio
-
-$EMU --bios "$FW" --kernel "$KERNEL" --initrd /tmp/rootfs.cpio \
-     --dtb board/virt.dtb --mem 512
-```
-
-`/init` 会自动在 VM 内执行：`tcc hello.c -o hello && ./hello`，
-输出 "Hello, world!"（在 VM 里现场编译，非预编译），随后自动关机。
-想手动交互可编辑 `board/alpine/init.tmpl`（末行 `poweroff -f` 删掉即可得 shell）。
+`board/alpine/build-rootfs.sh` 生成含 musl + tcc 的 initramfs；
+`/init` 自动执行 `tcc hello.c -o hello && ./hello`（VM 内现场编译），
+随后自动关机。想手动交互可编辑 `board/alpine/init.tmpl`（删掉末行
+`poweroff -f` 即可得 shell）。
 
 ### 4. 通用选项
 

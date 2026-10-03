@@ -2,10 +2,10 @@
 # 搭建 Alpine riscv64 + musl + tcc 的 initramfs（在宿主机执行，无需 root）
 # 用法: board/alpine/build-rootfs.sh <输出.cpio>
 set -e
-OUT="${1:-/tmp/rootfs.cpio}"
+OUT="${1:-dist/rootfs.cpio}"
 DL="/tmp/alpine-dl"
 M=https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.22
-mkdir -p "$DL"
+mkdir -p "$DL" "$(dirname "$OUT")"
 
 # 1. 下载（minirootfs + tcc + tcc-libs-static + musl-dev）
 test -f "$DL/minirootfs.tar.gz" || curl -s -o "$DL/minirootfs.tar.gz" \
