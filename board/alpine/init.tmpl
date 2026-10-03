@@ -17,4 +17,6 @@ echo "--- exit code: $? ---"
 echo "--- file info ---"
 ls -l hello
 file hello 2>/dev/null || true
-poweroff -f
+echo
+echo "进入交互 shell（poweroff -f 关机）"
+exec /bin/sh
