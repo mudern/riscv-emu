@@ -259,7 +259,8 @@ cargo build --release
 ### 2. OpenSBI + Linux + busybox shell
 
 前置（一次性）：
-- 内核 Image：见上文"启动 Linux"一节的构建命令（`build-rv64-emu/arch/riscv/boot/Image`）
+- 内核 Image：见上文"启动 Linux"一节的构建命令（`build-rv64-emu/arch/riscv/boot/Image`）。
+  **注意**：内核不含内嵌 initramfs，必须配 `--initrd`
 - OpenSBI 固件：`fw_dynamic.bin`（构建命令见上文）
 
 ```sh
@@ -267,9 +268,11 @@ EMU=./target/x86_64-unknown-linux-musl/release/riscv-emu
 FW=~/Code/source/opensbi/build/platform/generic/firmware/fw_dynamic.bin
 KERNEL=~/Code/source/linux/build-rv64-emu/arch/riscv/boot/Image
 
-$EMU --bios "$FW" --kernel "$KERNEL" --dtb board/virt.dtb
+$EMU --bios "$FW" --kernel "$KERNEL" --initrd initramfs/busybox.cpio --dtb board/virt.dtb
 # 引导至 busybox 交互 shell（stdin 已接通，可输入命令），
 # 退出：poweroff -f
+# busybox.cpio 可用 gen_init_cpio 重新生成：
+# ~/Code/source/linux/build-rv64-emu/usr/gen_init_cpio initramfs/initramfs.list > initramfs/busybox.cpio
 ```
 
 ### 3. Alpine + musl + tcc：在模拟器里编译程序
