@@ -57,7 +57,8 @@ fn check_perm(
         return Err(page_fault(access));
     }
     let user_page = flags & PTE_U != 0;
-    if mode == Privilege::S && user_page && !sum {
+    // SUM 对取指无效果（§4.3.2）：S 态取 U 页取指无条件 fault
+    if mode == Privilege::S && user_page && (access == Access::Fetch || !sum) {
         return Err(page_fault(access));
     }
     if mode == Privilege::U && !user_page {
@@ -311,6 +312,41 @@ mod tests {
                 &walk_pmp()
             ),
             Err(Exception::LoadPageFault)
+        );
+    }
+
+    #[test]
+    fn sum_has_no_effect_on_fetch() {
+        // 规范 4.3.2：SUM 对取指无效果——S 态取 U 页取指无条件 fault
+        let mut bus = Bus::new(1024 * 1024);
+        let root = DRAM_BASE + 0x10_000;
+        let l1 = root + 0x1000;
+        let l0 = root + 0x2000;
+        let va = 0x4000_0000u64;
+        let vpn = [va >> 12 & 0x1FF, va >> 21 & 0x1FF, va >> 30 & 0x1FF];
+        write_pte(&mut bus, root + vpn[2] * 8, ((l1 >> 12) << 10) | PTE_V);
+        write_pte(&mut bus, l1 + vpn[1] * 8, ((l0 >> 12) << 10) | PTE_V);
+        write_pte(
+            &mut bus,
+            l0 + vpn[0] * 8,
+            (0x8000_2000 >> 10) | PTE_V | PTE_R | PTE_W | PTE_X | PTE_U | PTE_A | PTE_D,
+        );
+        let satp = sv39(root);
+        let mut mmu = Mmu::new();
+        let pmp = full_pmp();
+        // 数据访问：SUM=1 放行、SUM=0 拒绝
+        assert!(mmu
+            .translate(&mut bus, satp, Privilege::S, false, true, va, Access::Load, &pmp)
+            .is_ok());
+        assert!(mmu
+            .translate(&mut bus, satp, Privilege::S, false, false, va, Access::Load, &pmp)
+            .is_err());
+        mmu.flush();
+        // 取指：SUM=1 也不放行
+        assert_eq!(
+            mmu.translate(&mut bus, satp, Privilege::S, false, true, va, Access::Fetch, &pmp),
+            Err(Exception::InstructionPageFault),
+            "SUM 对取指无效果"
         );
     }
 

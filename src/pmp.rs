@@ -84,9 +84,9 @@ impl Pmp {
     /// pmpaddr 全 1（54 位）时 base=0、size=2^56，覆盖整个 PA 空间
     fn napot_range(pmpaddr: u64) -> (u64, u64) {
         let ones = pmpaddr.trailing_ones().min(54);
-        let size = 8u64 << ones;
+        let size = 8u64 << ones; // 区域大小 = 4 × 2^(ones+1)
         let base = (pmpaddr & !((1u64 << ones) - 1)) << 2;
-        (base, size.saturating_sub(4))
+        (base, size)
     }
 
     /// 访问 [pa, pa+len) 是否允许。
@@ -176,6 +176,18 @@ mod tests {
         assert!(pmp.allows(0x8000_1000, 8, PmpAccess::Read, Privilege::U));
         assert!(!pmp.allows(0x8000_1000, 8, PmpAccess::Write, Privilege::U));
         assert!(!pmp.allows(0x9000_0000, 8, PmpAccess::Read, Privilege::U), "区外无匹配应拒绝");
+    }
+
+    #[test]
+    fn napot_full_size_including_top_bytes() {
+        let mut pmp = Pmp::default();
+        // NAPOT [0x8000_0000, +16)：曾因错误减 4 导致顶部 4 字节被拒
+        pmp.write_cfg(0, CFG_A_NAPOT | CFG_R | CFG_W | CFG_X);
+        pmp.write_addr(0, (0x8000_0000 >> 2) | 1); // NAPOT: base=0x8000_0000, size=16
+        for off in [0u64, 4, 8, 12] {
+            assert!(pmp.allows(0x8000_0000 + off, 4, PmpAccess::Read, Privilege::U));
+        }
+        assert!(!pmp.allows(0x8000_0010, 4, PmpAccess::Read, Privilege::U), "区域外");
     }
 
     #[test]

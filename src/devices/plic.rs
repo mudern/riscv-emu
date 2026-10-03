@@ -113,10 +113,13 @@ impl Plic {
     }
 
     /// 完成（写 claim 寄存器）：清网关占用。之后若线仍高（重新上沿）
-    /// 会再次通知。源 0 忽略（QEMU 对 value=0 也清 claimed[0]，等效）。
+    /// 会再次通知。规范：对未认领源的 complete 写被忽略；源 0 忽略。
     pub fn complete(&mut self, src: u32) {
         if src > 0 && (src as usize) < PLIC_SOURCES {
-            self.in_service[(src / 32) as usize] &= !(1 << (src % 32));
+            let bit = 1 << (src % 32);
+            if self.in_service[(src / 32) as usize] & bit != 0 {
+                self.in_service[(src / 32) as usize] &= !bit;
+            }
         }
     }
 
@@ -255,6 +258,22 @@ mod tests {
         assert_eq!(p.claim(1), UART_IRQ);
         assert_eq!(p.claim(0), 0, "M context 未使能");
         p.complete(UART_IRQ);
+    }
+
+    #[test]
+    fn complete_of_unclaimed_is_ignored() {
+        let mut p = Plic::default();
+        p.enable[0][0] = 1 << UART_IRQ;
+        p.priority[UART_IRQ as usize] = 1;
+        // 未 claim 直接 complete：忽略（不影响网关）
+        p.complete(UART_IRQ);
+        // 正常流程：锁存 → claim → complete → 线撤销后不再通知
+        p.sync(IrqLines { uart: true });
+        assert_eq!(p.claim(0), UART_IRQ);
+        assert!(!p.irq_level(0));
+        p.complete(UART_IRQ);
+        p.sync(IrqLines { uart: false });
+        assert!(!p.irq_level(0));
     }
 
     #[test]

@@ -352,6 +352,31 @@ fn mret_to_m_retains_mprv() {
 }
 
 #[test]
+fn fp_csr_write_sets_fs_dirty() {
+    let mut a = Asm::new();
+    use reg::*;
+
+    // FS = Clean（2<<13）
+    a.emit32(addi(T0, ZERO, 2));
+    a.emit32(slli(T0, T0, 13));
+    a.emit32(csrw(0x300, T0));
+    // 写 fflags（0x001）→ FP 状态被修改 → FS=Dirty
+    a.emit32(addi(T0, ZERO, 1));
+    a.emit32(csrw(0x001, T0));
+    a.emit32(csrr(T1, 0x300));
+    a.addr_of(T3, RESULTS as i32);
+    a.emit32(sd(T1, T3, 0));
+    a.emit32(addi(A0, ZERO, 38));
+    a.emit32(addi(A7, ZERO, 93));
+    a.emit32(ECALL);
+
+    let mut m = a.into_machine(16);
+    assert_eq!(m.run(10_000), Halt::Exit(38));
+    let mstatus = m.bus.load(DRAM_BASE + RESULTS, 8).unwrap();
+    assert_eq!((mstatus >> 13) & 3, 3, "写 fflags 后 FS=Dirty");
+}
+
+#[test]
 fn fs_dirty_semantics() {
     let mut a = Asm::new();
     use reg::*;

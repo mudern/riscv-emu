@@ -747,6 +747,10 @@ impl Cpu {
                             self.fetch_page = None;
                             self.flush_fetch_caches();
                         }
+                        // 写浮点 CSR 修改 FP 架构状态 → FS=Dirty（规范 3.1.6.7）
+                        csr::csr::FFLAGS | csr::csr::FRM | csr::csr::FCSR => {
+                            self.fs_mark_dirty();
+                        }
                         _ => {}
                     }
                 }

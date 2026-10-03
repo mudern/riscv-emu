@@ -740,7 +740,10 @@ pub fn decode(w: u32) -> Result<Inst, Exception> {
             // SYSTEM
             if funct3 == 0 {
                 if (w >> 25) == 0x09 {
-                    return Ok(Inst::System(SystemOp::SfenceVma)); // rs1/rs2 字段含义忽略（无 TLB）
+                    if rd != 0 {
+                        return Err(Exception::IllegalInstruction); // SFENCE.VMA 要求 rd=0
+                    }
+                    return Ok(Inst::System(SystemOp::SfenceVma)); // rs1/rs2 字段含义忽略（flush all）
                 }
                 if rd != 0 || rs1 != 0 {
                     return Err(Exception::IllegalInstruction);
@@ -899,12 +902,17 @@ pub fn decode_compressed(h: u16) -> Result<Inst, Exception> {
                     rs1: rd,
                     imm: c_sext6(h),
                 }), // C.ADDI（rd=x0 即 C.NOP/HINT）
-                1 if rd != 0 => Ok(Inst::OpImm {
-                    op: AluOp::Addw,
-                    rd,
-                    rs1: rd,
-                    imm: c_sext6(h),
-                }), // C.ADDIW
+                1 => {
+                    if rd == 0 {
+                        return Err(Exception::IllegalInstruction); // c.addiw x0 保留
+                    }
+                    Ok(Inst::OpImm {
+                        op: AluOp::Addw,
+                        rd,
+                        rs1: rd,
+                        imm: c_sext6(h),
+                    }) // C.ADDIW
+                }
                 2 => Ok(Inst::OpImm {
                     op: AluOp::Add,
                     rd,
@@ -1111,6 +1119,18 @@ pub fn decode_compressed(h: u16) -> Result<Inst, Exception> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_reserved_encodings() {
+        // c.addiw rd=x0：保留编码 → illegal（曾误解码为 C.BNEZ）
+        assert_eq!(decode_compressed(0x2001), Err(Exception::IllegalInstruction));
+        // SFENCE.VMA rd≠0 → illegal
+        let sfence_rd = (0x09 << 25) | (1 << 7) | 0x73;
+        assert_eq!(decode(sfence_rd), Err(Exception::IllegalInstruction));
+        // 正确的 SFENCE.VMA（rd=0）仍合法
+        let sfence_ok = (0x09 << 25) | 0x73;
+        assert!(decode(sfence_ok).is_ok());
+    }
 
     #[test]
     fn decode_basic() {
