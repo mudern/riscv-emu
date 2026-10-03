@@ -1,0 +1,20 @@
+#!/bin/sh
+# 内嵌 Linux 的初始化 + 工具链冒烟：musl + tcc 编译并运行 hello world
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+echo
+echo "=== riscv-emu: Linux + musl + tcc ==="
+cat /etc/alpine-release
+cd /root
+echo "--- hello.c ---"
+cat hello.c
+echo "--- tcc hello.c -o hello ---"
+tcc hello.c -o hello
+echo "--- run ./hello ---"
+./hello
+echo "--- exit code: $? ---"
+echo "--- file info ---"
+ls -l hello
+file hello 2>/dev/null || true
+poweroff -f

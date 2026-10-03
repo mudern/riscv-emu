@@ -38,7 +38,8 @@
 
 	memory@80000000 {
 		device_type = "memory";
-		reg = <0x00 0x80000000 0x00 0x8000000>;
+		// size 占位符（hi,lo = 0x1DEADC0D,0x0DEADF00），--initrd 启动时回填
+		reg = <0x00 0x80000000 0x1DEADC0D 0x0DEADF00>;
 	};
 
 	cpus {
@@ -80,6 +81,13 @@
 	chosen {
 		stdout-path = "/soc/serial@10000000";
 		bootargs = "console=ttyS0";
+		// initrd/memory 占位符（非法地址，模拟器 --initrd 启动时按字节
+		// 模式搜索并回填真实值；QEMU 直接引导该 DTB 时为无效区间，无害）
+		linux,initrd-start = <0x1DEADC00 0x0DEADBE0>;
+		linux,initrd-end = <0x2DEADC00 0x0DEADBE1>;
+		// memory@80000000 节点的 reg 同步回填，此处占位
+		// （memory 大小的占位符写在 memory 节点内）
+
 		// 固定熵种子：保证两次引导内核随机池状态一致，便于差分
 		rng-seed = <0x1e76c20 0xe1a3be35 0x3475553d 0x6e8dddf0 0x340ae3ad 0x2bf2e8c2 0xbeae471d 0x104bbeca>;
 	};

@@ -5,7 +5,7 @@ use riscv_emu::{elf, exception::TrapInfo, machine::Halt, Machine};
 
 const USAGE: &str = "\
 用法: riscv-emu [--trace] [--stats] [--mem <MB>] [--bin] [--sbi] <image>
-      riscv-emu [--trace] [--stats] [--mem <MB>] --bios <fw> [--kernel <image>] [--dtb <dtb>]
+      riscv-emu [--trace] [--stats] [--mem <MB>] --bios <fw> [--kernel <image>] [--initrd <cpio>] [--dtb <dtb>]
 
   <image>   RISC-V ELF64 可执行文件（静态、非 PIE），或 --bin 时的裸二进制
   --trace   打印每条指令
@@ -16,6 +16,7 @@ const USAGE: &str = "\
   --bios    固件 ELF（如 OpenSBI fw_dynamic）：QEMU 同款引导流程，
             a0=hartid a1=DTB a2=fw_dynamic_info
   --kernel  固件模式下的 payload（ELF 按其地址加载，裸二进制放 0x8020_0000）
+  --initrd  initramfs cpio（未压缩），加载到 DRAM_BASE+64MB 并回填 DTB
   --dtb     固件模式下的设备树（默认 board/virt.dtb）
 ";
 
@@ -43,6 +44,7 @@ fn main() -> ExitCode {
     let mut bios: Option<String> = None;
     let mut kernel: Option<String> = None;
     let mut dtb: Option<String> = None;
+    let mut initrd: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -51,7 +53,7 @@ fn main() -> ExitCode {
             "--stats" => stats = true,
             "--bin" => flat_bin = true,
             "--sbi" => sbi = true,
-            "--bios" | "--kernel" | "--dtb" => {
+            "--bios" | "--kernel" | "--dtb" | "--initrd" => {
                 let tag = args[i][2..].to_string();
                 i += 1;
                 let Some(path) = args.get(i) else {
@@ -62,6 +64,7 @@ fn main() -> ExitCode {
                     "bios" => bios = Some(path.clone()),
                     "kernel" => kernel = Some(path.clone()),
                     "dtb" => dtb = Some(path.clone()),
+                    "initrd" => initrd = Some(path.clone()),
                     _ => unreachable!(),
                 }
             }
@@ -122,10 +125,17 @@ fn main() -> ExitCode {
             Ok(d) => d,
             Err(c) => return c,
         };
-        return boot_firmware(trace, stats, mem_mb, fw, kernel_data, dtb_data);
+        let initrd_data = match &initrd {
+            Some(p) => match read_file("initrd", p) {
+                Ok(d) => Some(d),
+                Err(c) => return c,
+            },
+            None => None,
+        };
+        return boot_firmware(trace, stats, mem_mb, fw, kernel_data, initrd_data, dtb_data);
     }
-    if kernel.is_some() || dtb.is_some() {
-        eprintln!("--kernel/--dtb 需要 --bios");
+    if kernel.is_some() || dtb.is_some() || initrd.is_some() {
+        eprintln!("--kernel/--dtb/--initrd 需要 --bios");
         return ExitCode::FAILURE;
     }
 
@@ -168,12 +178,40 @@ fn main() -> ExitCode {
 
 /// 固件引导：加载 fw_dynamic.elf + payload + DTB，按 QEMU 语义摆好
 /// a0/a1/a2 与 fw_dynamic_info，从固件入口开始执行。
+/// DTB 字节模式回填：搜索 BE 编码的占位符并替换
+fn patch_dtb_u64(dtb: &mut [u8], placeholder: u64, value: u64) -> bool {
+    let pat = placeholder.to_be_bytes();
+    for i in 0..=dtb.len().saturating_sub(8) {
+        if dtb[i..i + 8] == pat {
+            dtb[i..i + 8].copy_from_slice(&value.to_be_bytes());
+            return true;
+        }
+    }
+    false
+}
+
+/// memory 节点 reg（16 字节）的 size 回填
+fn patch_dtb_memory_size(dtb: &mut [u8], size: u64) -> bool {
+    const PAT: [u8; 16] = [
+        0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x1D, 0xEA, 0xDC, 0x0D, 0x0D, 0xEA, 0xDF,
+        0x00,
+    ];
+    for i in 0..=dtb.len().saturating_sub(16) {
+        if dtb[i..i + 16] == PAT {
+            dtb[i..i + 16][8..16].copy_from_slice(&size.to_be_bytes());
+            return true;
+        }
+    }
+    false
+}
+
 fn boot_firmware(
     trace: bool,
     stats: bool,
     mem_mb: usize,
     fw: Vec<u8>,
     kernel: Option<Vec<u8>>,
+    initrd: Option<Vec<u8>>,
     dtb: Vec<u8>,
 ) -> ExitCode {
     let mut machine = Machine::new(mem_mb);
@@ -216,6 +254,42 @@ fn boot_firmware(
                 return ExitCode::FAILURE;
             }
         }
+    }
+
+    // initrd：固定加载到 DRAM_BASE + 64MB（内核 Image ~18MB，不重叠）
+    let mut dtb = dtb;
+    if let Some(data) = &initrd {
+        const INITRD_OFF: u64 = 0x0400_0000;
+        let addr = riscv_emu::bus::DRAM_BASE + INITRD_OFF;
+        if addr + data.len() as u64 > machine.bus.dram_end() {
+            eprintln!("initrd 超出 RAM（{} 字节），请加大 --mem", data.len());
+            return ExitCode::FAILURE;
+        }
+        if !machine.bus.write_dram(addr, data) {
+            eprintln!("initrd 写入失败");
+            return ExitCode::FAILURE;
+        }
+        // 回填 /chosen 的 initrd 起止占位符
+        let pat_start = 0x1DEA_DC00_0DEA_DBE0;
+        let pat_end = 0x2DEA_DC00_0DEA_DBE1;
+        let start = addr;
+        let end = addr + data.len() as u64;
+        if !patch_dtb_u64(&mut dtb, pat_start, start) || !patch_dtb_u64(&mut dtb, pat_end, end) {
+            eprintln!("DTB 缺少 initrd 占位符");
+            return ExitCode::FAILURE;
+        }
+        eprintln!(
+            "initrd: {} 字节 @ {:#x}..{:#x}",
+            data.len(),
+            start,
+            end
+        );
+    }
+    // 回填 memory 节点大小（DTB 声明量必须与 --mem 一致）
+    let dram_size = mem_mb as u64 * 1024 * 1024;
+    if !patch_dtb_memory_size(&mut dtb, dram_size) {
+        eprintln!("DTB 缺少 memory 大小占位符");
+        return ExitCode::FAILURE;
     }
 
     // DTB 放置对齐 QEMU riscv_compute_fdt_addr：align_down(RAM 顶 - fdt大小, 2MB)
