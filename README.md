@@ -246,6 +246,56 @@ tests/
   fp_ctx.rs      FP 保存/恢复与内存完整性（内核 fstate 模式）
 ```
 
+## 使用教程
+
+### 1. 裸机程序（阶段 1/2，无需固件）
+
+```sh
+cargo build --release
+./target/x86_64-unknown-linux-musl/release/riscv-emu examples/minios.elf
+./target/x86_64-unknown-linux-musl/release/riscv-emu --stats examples/torture.elf
+```
+
+### 2. OpenSBI + Linux + busybox shell
+
+前置（一次性）：
+- 内核 Image：见上文"启动 Linux"一节的构建命令（`build-rv64-emu/arch/riscv/boot/Image`）
+- OpenSBI 固件：`fw_dynamic.bin`（构建命令见上文）
+
+```sh
+EMU=./target/x86_64-unknown-linux-musl/release/riscv-emu
+FW=~/Code/source/opensbi/build/platform/generic/firmware/fw_dynamic.bin
+KERNEL=~/Code/source/linux/build-rv64-emu/arch/riscv/boot/Image
+
+$EMU --bios "$FW" --kernel "$KERNEL" --dtb board/virt.dtb
+# 引导至 busybox 交互 shell（stdin 已接通，可输入命令），
+# 退出：poweroff -f
+```
+
+### 3. Alpine + musl + tcc：在模拟器里编译程序
+
+```sh
+# 一次性：生成 Alpine rootfs initramfs（下载 ~8MB，无需 root）
+board/alpine/build-rootfs.sh /tmp/rootfs.cpio
+
+$EMU --bios "$FW" --kernel "$KERNEL" --initrd /tmp/rootfs.cpio \
+     --dtb board/virt.dtb --mem 512
+```
+
+`/init` 会自动在 VM 内执行：`tcc hello.c -o hello && ./hello`，
+输出 "Hello, world!"（在 VM 里现场编译，非预编译），随后自动关机。
+想手动交互可编辑 `board/alpine/init.tmpl`（末行 `poweroff -f` 删掉即可得 shell）。
+
+### 4. 通用选项
+
+| 选项 | 说明 |
+|---|---|
+| `--mem <MB>` | RAM 大小（默认 128；Alpine 流程用 512） |
+| `--initrd <cpio>` | 未压缩 newc 格式 initramfs（放 DRAM_BASE+64MB，回填 DTB） |
+| `--trace` | 逐条指令跟踪 |
+| `--stats` | 退出时打印指令数/用时/MIPS |
+| `--sbi` | 内置 SBI（不用 OpenSBI 跑 S 态程序时用） |
+
 ## 路线图（后续阶段）
 
 1. ~~特权级与 MMU~~、~~中断~~、~~SBI~~（阶段 2）
