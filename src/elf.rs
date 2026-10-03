@@ -62,7 +62,15 @@ pub fn load_elf(image: &[u8], bus: &mut Bus) -> Result<u64, String> {
         if p_offset + p_filesz > image.len() {
             return Err(format!("PT_LOAD #{i} 文件数据越界"));
         }
-        if p_paddr < DRAM_BASE || p_paddr + p_memsz > bus.dram_end() {
+        let p_end = match p_paddr.checked_add(p_memsz) {
+            Some(e) => e,
+            None => {
+                return Err(format!(
+                    "PT_LOAD #{i} 段大小溢出（paddr={p_paddr:#x}, memsz={p_memsz:#x}）"
+                ))
+            }
+        };
+        if p_paddr < DRAM_BASE || p_end > bus.dram_end() {
             return Err(format!(
                 "PT_LOAD #{i} 不在 RAM 范围内（paddr={p_paddr:#x}, memsz={p_memsz:#x}，RAM: {DRAM_BASE:#x}..{:#x}）",
                 bus.dram_end()

@@ -338,16 +338,15 @@ impl Csrs {
                 (self.mstatus & !SSTATUS_MASK) | (val & SSTATUS_MASK),
             ),
             csr::MISA => {
-                // 可写位 = 本实现支持的扩展（I M A F D C S U）；MXL 只读
-                const SUPPORTED: u64 = (1 << 0)
-                    | (1 << 2)
+                // 可写位 = 可选扩展（M A F D C S U）；I 必选硬连 1，MXL 只读
+                const CLEARABLE: u64 = (1 << 2)
                     | (1 << 3)
                     | (1 << 5)
                     | (1 << 8)
                     | (1 << 12)
                     | (1 << 18)
                     | (1 << 20);
-                self.misa = (2 << 62) | (val & SUPPORTED);
+                self.misa = (2 << 62) | (1 << 0) | (val & CLEARABLE);
             }
             csr::MEDELEG => self.medeleg = val & MEDELEG_MASK,
             csr::MIDELEG => self.mideleg = val & MIP_WRITABLE, // 可委派 = S 态中断源
