@@ -248,53 +248,37 @@ tests/
 
 ## 使用教程
 
-### 一键启动（推荐）
+两个环境脚本：产物缺失时自动**拉源码编译**（git clone + 构建，源码进
+`dist/src/`，二进制产物进 `dist/`，均已 gitignore；`~/Code/source` 下
+已有同名源码则直接复用，不重复克隆）。首次构建约 5-10 分钟。
+
+### 1. 基础 Linux：OpenSBI + 内核 + busybox 交互 shell
 
 ```sh
 cargo build --release      # 编译模拟器
-./run.sh minios            # 裸机迷你 OS
-./run.sh torture           # 指令集压力测试
-./run.sh linux             # OpenSBI + Linux + busybox 交互 shell
-./run.sh alpine            # Alpine + musl + tcc：VM 内编译 hello world
+./linux.sh                 # 自动：构建 OpenSBI/内核 → 生成 busybox.cpio → 启动
 ```
 
-产物（OpenSBI 固件 / Linux Image / rootfs.cpio）缺失时 `run.sh` 会自动
-调用 `dist/build-all.sh`（git clone + 编译，源码放 `dist/src/`，二进制
-输出到 `dist/`，均已 gitignore；`~/Code/source` 下已有同名源码则直接复用）。
-首次构建约 5-10 分钟（下载 260MB + 编译）。
+`~ #` 提示符后即可敲命令（stdin 已接通），`poweroff -f` 退出。
+等价于 `sh dist/build-all.sh` + `gen_init_cpio` + 手动启动。
 
-手动等价命令：
+### 2. 基本操作系统：Alpine + musl + tcc，VM 内编译程序
 
 ```sh
-sh dist/build-all.sh                    # 拉源码构建固件 + 内核（可只传 opensbi|linux）
-board/alpine/build-rootfs.sh dist/rootfs.cpio   # 生成 Alpine initramfs
-
-./target/x86_64-unknown-linux-musl/release/riscv-emu \
-    --bios dist/fw_dynamic.bin --kernel dist/Image \
-    --initrd dist/rootfs.cpio --dtb board/virt.dtb --mem 512
+./alpine.sh                # 自动：构建/复用内核 → 下载 Alpine+tcc rootfs → 启动
 ```
 
-### 源码级细节
+VM 内自动执行 `tcc hello.c -o hello && ./hello`（**现场编译**，输出
+"Hello, world!"），随后 `poweroff -f` 自动关机。想手动交互可编辑
+`board/alpine/init.tmpl`（删掉末行 `poweroff -f` 即可得 Alpine shell，
+内有完整 busybox + musl + tcc）。
 
-### 1. 裸机程序（阶段 1/2，无需固件）
+### 3. 裸机程序（无需固件）
 
 ```sh
 ./target/x86_64-unknown-linux-musl/release/riscv-emu examples/minios.elf
 ./target/x86_64-unknown-linux-musl/release/riscv-emu --stats examples/torture.elf
 ```
-
-### 2. OpenSBI + Linux + busybox shell
-
-内核不含内嵌 initramfs，必须配 `--initrd initramfs/busybox.cpio`
-（busybox.cpio 由 `gen_init_cpio initramfs/initramfs.list` 生成，
-`dist/build-all.sh` 会自动做；stdin 已接通，`poweroff -f` 退出）。
-
-### 3. Alpine + musl + tcc
-
-`board/alpine/build-rootfs.sh` 生成含 musl + tcc 的 initramfs；
-`/init` 自动执行 `tcc hello.c -o hello && ./hello`（VM 内现场编译），
-随后自动关机。想手动交互可编辑 `board/alpine/init.tmpl`（删掉末行
-`poweroff -f` 即可得 shell）。
 
 ### 4. 通用选项
 

@@ -3,6 +3,9 @@
 # 用法: board/alpine/build-rootfs.sh <输出.cpio>
 set -e
 OUT="${1:-dist/rootfs.cpio}"
+# 后续会 cd 进 rootfs，输出路径先转为绝对
+mkdir -p "$(dirname "$OUT")"
+OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"
 DL="/tmp/alpine-dl"
 M=https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.22
 mkdir -p "$DL" "$(dirname "$OUT")"
